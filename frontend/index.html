@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="CodeYF — 本地编程智能体工作台" />
+    <title>CodeYF · Agent Workspace</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%2324231f'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='Georgia' font-size='18' fill='white'%3EC%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <svg class="icon-sprite" aria-hidden="true">
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 6.5h6l2 2H20.5v10h-17z" /></symbol>
+      <symbol id="i-code" viewBox="0 0 24 24"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M14 5l-4 14" /></symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6" /></symbol>
+      <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none" /></symbol>
+      <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></symbol>
+      <symbol id="i-git" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2" /><circle cx="18" cy="7" r="2" /><circle cx="6" cy="19" r="2" /><path d="M6 7v10M8 6c5 0 3 8 8 8h2M18 9v5" /></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z" /></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" /></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2" /><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" /></symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="m7 9 3 3-3 3M13 15h4" /></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6zM14 3v5h5" /></symbol>
+      <symbol id="i-send" viewBox="0 0 24 24"><path d="m4 4 17 8-17 8 3-8zM7 12h14" /></symbol>
+      <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="m9 12 5-5a3 3 0 0 1 4 4l-7 7a5 5 0 0 1-7-7l7-7" /></symbol>
+      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10" /><circle cx="16" cy="7" r="2" /><circle cx="8" cy="17" r="2" /></symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4.5 6v5c0 4.8 3.1 8.4 7.5 10 4.4-1.6 7.5-5.2 7.5-10V6z" /><path d="m9 12 2 2 4-5" /></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" /></symbol>
+      <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></symbol>
+      <symbol id="i-command" viewBox="0 0 24 24"><path d="M9 6V5a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v14a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z" /></symbol>
+      <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3c.6 4.7 3.3 7.4 8 8-4.7.6-7.4 3.3-8 8-.6-4.7-3.3-7.4-8-8 4.7-.6 7.4-3.3 8-8z" /></symbol>
+      <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></symbol>
+    </svg>
+
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <div class="brand-row">
+          <div class="brand-mark" aria-hidden="true"><span>C</span></div>
+          <div class="brand-copy">
+            <strong>CodeYF</strong>
+            <span>Agent workspace</span>
+          </div>
+          <button class="icon-button sidebar-collapse" aria-label="收起侧栏" data-tooltip="收起侧栏">
+            <svg><use href="#i-panel" /></svg>
+          </button>
+        </div>
+
+        <button class="new-task-button" id="newTaskButton">
+          <svg><use href="#i-plus" /></svg>
+          <span>新建任务</span>
+          <kbd>⌘ N</kbd>
+        </button>
+
+        <button class="search-button" id="searchButton">
+          <svg><use href="#i-search" /></svg>
+          <span>搜索任务</span>
+          <kbd>⌘ K</kbd>
+        </button>
+
+        <nav class="task-nav" id="taskNav" aria-label="任务列表">
+          <div class="nav-empty">正在读取真实会话…</div>
+        </nav>
+
+        <div class="sidebar-footer">
+          <button class="workspace-card">
+            <span class="workspace-icon"><svg><use href="#i-folder" /></svg></span>
+            <span><strong id="workspaceName">CodeYF</strong><small id="workspacePath">正在连接后端…</small></span>
+            <svg class="workspace-more"><use href="#i-more" /></svg>
+          </button>
+          <button class="profile-card">
+            <span class="avatar">YF</span>
+            <span><strong>本地工作区</strong><small id="profileStatus">正在连接…</small></span>
+            <span class="online-dot"></span>
+          </button>
+        </div>
+      </aside>
+
+      <main class="main-panel">
+        <header class="topbar">
+          <div class="topbar-title">
+            <button class="icon-button mobile-menu" id="mobileMenu" aria-label="打开任务列表"><svg><use href="#i-panel" /></svg></button>
+            <div>
+              <div class="breadcrumb"><span>CodeYF</span><svg><use href="#i-chevron" /></svg><span id="breadcrumbPath">真实工作区</span></div>
+              <h1 id="threadTitle">新任务</h1>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <span class="run-state"><i></i><span id="runStateText">空闲</span></span>
+            <button class="ghost-button" id="openDiff"><svg><use href="#i-git" /></svg><span>0 个变更</span></button>
+            <button class="icon-button" id="themeToggle" aria-label="切换主题" data-tooltip="切换主题"><svg><use href="#i-sun" /></svg></button>
+            <button class="icon-button right-panel-toggle" id="rightPanelToggle" aria-label="切换详情面板" data-tooltip="切换详情"><svg><use href="#i-panel" /></svg></button>
+          </div>
+        </header>
+
+        <section class="conversation" id="conversation" aria-live="polite">
+          <div class="conversation-inner">
+            <div class="empty-state" id="emptyState">
+              <span class="agent-logo"><svg><use href="#i-spark" /></svg></span>
+              <h2>把真实编程任务交给 CodeYF</h2>
+              <p>这里只显示后端实际执行的模型调用、工具结果和文件变更，不再展示演示数据。</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="composer-wrap">
+          <div class="context-meter" title="当前会话统计">
+            <span>会话</span><span class="meter"><i id="contextMeterFill"></i></span><span id="contextMeterText">0 轮 · 0 次工具</span>
+          </div>
+          <form class="composer" id="composer">
+            <textarea id="promptInput" rows="1" placeholder="描述任务，或输入后续要求…" aria-label="任务输入"></textarea>
+            <div class="composer-toolbar">
+              <div class="composer-tools">
+                <button type="button" class="icon-button small" data-tooltip="添加上下文"><svg><use href="#i-paperclip" /></svg></button>
+                <button type="button" class="mode-button" id="modeButton"><svg><use href="#i-shield" /></svg><span>Agent · Balanced</span><svg class="mini-chevron"><use href="#i-chevron" /></svg></button>
+              </div>
+              <div class="composer-actions">
+                <span><kbd>Enter</kbd> 发送</span>
+                <button type="submit" class="send-button" id="sendButton" aria-label="发送"><svg><use href="#i-send" /></svg></button>
+              </div>
+            </div>
+          </form>
+          <p class="composer-hint">CodeYF 可能出错。应用修改前请检查 diff，重要操作会请求确认。</p>
+        </section>
+      </main>
+
+      <aside class="details-panel" id="detailsPanel">
+        <div class="details-tabs" role="tablist">
+          <button class="active" role="tab" aria-selected="true" data-panel="changes">变更 <span id="changeCount">0</span></button>
+          <button role="tab" aria-selected="false" data-panel="terminal">终端</button>
+          <button role="tab" aria-selected="false" data-panel="context">上下文</button>
+          <button class="icon-button details-close" id="detailsClose" aria-label="关闭详情"><svg><use href="#i-x" /></svg></button>
+        </div>
+
+        <section class="detail-content active" data-content="changes">
+          <div class="detail-toolbar">
+            <div><strong>真实工作区变更</strong><small id="changeSummary">+0 −0</small></div>
+            <button class="ghost-button compact" id="refreshPreview"><svg><use href="#i-file" /></svg>刷新预览</button>
+          </div>
+          <div class="file-tree" id="changeTree"><div class="panel-empty">当前会话尚未修改文件</div></div>
+          <div class="editor-head">
+            <div><span class="file-badge python" id="editorBadge">FILE</span><strong id="editorFileName">未选择文件</strong></div>
+            <span>磁盘当前内容</span>
+          </div>
+          <div class="code-editor" id="codeEditor" aria-label="代码预览"><div class="panel-empty">应用补丁后，可在此查看磁盘上的真实文件内容。</div></div>
+        </section>
+
+        <section class="detail-content" data-content="terminal">
+          <div class="terminal-panel-head">
+            <div><svg><use href="#i-terminal" /></svg><span>真实命令输出</span></div>
+            <button class="icon-button small"><svg><use href="#i-more" /></svg></button>
+          </div>
+          <pre class="full-terminal">当前会话尚未执行命令。</pre>
+        </section>
+
+        <section class="detail-content context-content" data-content="context">
+          <div class="context-hero"><span id="contextPercent">0%</span><div><strong>真实会话统计</strong><small id="contextUsage">等待模型返回 usage</small></div></div>
+          <div class="context-breakdown">
+            <div><span><i class="dot system"></i>模型轮次</span><strong id="turnCount">0</strong></div>
+            <div><span><i class="dot user"></i>工具调用</span><strong id="toolCallCount">0</strong></div>
+            <div><span><i class="dot files"></i>事件数量</span><strong id="eventCount">0</strong></div>
+          </div>
+          <div class="context-section">
+            <h3>模型与状态</h3>
+            <div class="context-item"><svg><use href="#i-spark" /></svg><span><strong id="contextModel">未连接</strong><small id="contextStatus">空闲</small></span><b>LIVE</b></div>
+          </div>
+          <button class="ghost-button full" id="reloadSession"><svg><use href="#i-spark" /></svg>重新读取会话</button>
+        </section>
+      </aside>
+    </div>
+
+    <div class="modal-backdrop" id="workspaceModal" aria-hidden="true">
+      <div class="workspace-dialog" role="dialog" aria-modal="true" aria-labelledby="workspaceTitle">
+        <div class="workspace-dialog-head">
+          <div class="workspace-switch-icon"><svg><use href="#i-folder" /></svg></div>
+          <div><span class="eyebrow">本地目录</span><h2 id="workspaceTitle">切换工作区</h2></div>
+          <button class="icon-button" id="workspaceClose" aria-label="关闭"><svg><use href="#i-x" /></svg></button>
+        </div>
+        <p class="workspace-help">新任务的文件读取、修改和命令执行都会限制在所选目录内。历史任务继续使用各自原工作区。</p>
+        <div class="workspace-recent">
+          <span class="workspace-label">最近工作区</span>
+          <div id="workspaceList"><div class="panel-empty">正在读取…</div></div>
+        </div>
+        <form id="workspaceForm">
+          <label for="workspaceInput">本机目录绝对路径</label>
+          <div class="workspace-input-row">
+            <input id="workspaceInput" autocomplete="off" spellcheck="false" placeholder="例如 D:\\Projects\\my-app" />
+            <button class="primary-button" type="submit">使用此目录</button>
+          </div>
+          <small id="workspaceError" role="alert"></small>
+        </form>
+      </div>
+    </div>
+
+    <div class="command-overlay" id="commandPalette" aria-hidden="true">
+      <div class="command-palette">
+        <div class="palette-search"><svg><use href="#i-search" /></svg><input id="paletteInput" placeholder="搜索任务或操作…" /><kbd>Esc</kbd></div>
+        <div class="palette-results">
+          <span class="palette-label">快速操作</span>
+          <button data-action="new"><svg><use href="#i-plus" /></svg><span><strong>新建任务</strong><small>在当前工作区开始</small></span><kbd>⌘ N</kbd></button>
+          <button data-action="terminal"><svg><use href="#i-terminal" /></svg><span><strong>打开终端</strong><small>查看当前命令输出</small></span><kbd>⌘ J</kbd></button>
+          <button data-action="changes"><svg><use href="#i-git" /></svg><span><strong>查看变更</strong><small>真实 apply_patch 结果</small></span></button>
+          <span class="palette-label">真实会话</span>
+          <div id="paletteSessions"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>
