@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+import pytest
 
 from codeyf.config import AppConfig
 from codeyf.domain import ModelResponse, ToolCall
@@ -122,3 +125,99 @@ def test_web_task_applies_patch_to_disk_and_exposes_real_preview(tmp_path: Path)
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_web_approval_wakes_worker_without_timeout(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    frontend = tmp_path / "frontend"
+    workspace.mkdir()
+    frontend.mkdir()
+    (frontend / "index.html").write_text("<h1>CodeYF</h1>", encoding="utf-8")
+    model = ScriptedModelClient([
+        ModelResponse(
+            tool_calls=(
+                ToolCall("call_approved", "run_command", {
+                    "argv": [sys.executable, "-c", "print('approved locally')"],
+                }),
+            ),
+            finish_reason="tool_calls",
+        ),
+        ModelResponse(content="本地审批测试完成。", finish_reason="stop"),
+    ])
+    config = AppConfig()
+    config.storage.enabled = False
+    config.security.approval = "strict"
+    service = AgentService(config, workspace, model_factory=lambda: model)
+    server = CodeYFHTTPServer(("127.0.0.1", 0), service, frontend)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    started = time.monotonic()
+    try:
+        session = request_json(base + "/api/sessions", "POST", {})
+        request_json(base + f"/api/sessions/{session['session_id']}/tasks", "POST", {"message": "运行离线命令"})
+        for _ in range(200):
+            snapshot = request_json(base + f"/api/sessions/{session['session_id']}")
+            requested = next(
+                (event for event in snapshot["events"] if event["type"] == "approval.requested"),
+                None,
+            )
+            if requested:
+                break
+            time.sleep(0.01)
+        assert requested is not None
+        approval_id = requested["data"]["approval_id"]
+        accepted = request_json(
+            base + f"/api/sessions/{session['session_id']}/approvals/{approval_id}",
+            "POST",
+            {"decision": "approve_once"},
+        )
+        assert accepted["accepted"] is True
+        for _ in range(200):
+            snapshot = request_json(base + f"/api/sessions/{session['session_id']}")
+            if snapshot["status"] == "completed":
+                break
+            time.sleep(0.01)
+        assert snapshot["status"] == "completed"
+        assert time.monotonic() - started < 2
+        decided = next(event for event in snapshot["events"] if event["type"] == "approval.decided")
+        assert decided["data"]["decision"] == "approve_once"
+        event_types = [event["type"] for event in snapshot["events"]]
+        approval_index = event_types.index("approval.decided")
+        running_index = next(
+            index
+            for index, event in enumerate(snapshot["events"])
+            if event["type"] == "state.changed"
+            and event["data"]["to"] == "running"
+            and index > approval_index
+        )
+        started_index = event_types.index("tool.started")
+        finished_index = event_types.index("tool.finished")
+        assert approval_index < running_index < started_index < finished_index
+        finished = next(event for event in snapshot["events"] if event["type"] == "tool.finished")
+        assert finished["data"]["result"]["ok"] is True
+        assert finished["data"]["result"]["data"]["stdout"].strip() == "approved locally"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_server_rejects_second_instance_on_same_port(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    frontend = tmp_path / "frontend"
+    workspace.mkdir()
+    frontend.mkdir()
+    (frontend / "index.html").write_text("<h1>CodeYF</h1>", encoding="utf-8")
+    config = AppConfig()
+    config.storage.enabled = False
+    first = CodeYFHTTPServer(("127.0.0.1", 0), AgentService(config, workspace), frontend)
+    try:
+        with pytest.raises(OSError):
+            CodeYFHTTPServer(
+                ("127.0.0.1", first.server_port),
+                AgentService(config, workspace),
+                frontend,
+            )
+    finally:
+        first.server_close()

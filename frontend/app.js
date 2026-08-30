@@ -567,6 +567,16 @@ function renderSnapshot(snapshot) {
   );
   for (const event of snapshot.events || []) {
     if (event.type === "model.responded" && event.data?.usage) backendState.usage = event.data.usage;
+    if (event.type === "tool.requested") {
+      ensureToolCard(event.data?.tool_call_id, event.data?.name, event.data?.arguments);
+    }
+    if (event.type === "tool.started") {
+      const card = ensureToolCard(event.data?.tool_call_id, event.data?.name);
+      $(".activity-duration", card).textContent = "运行中";
+    }
+    if (event.type === "tool.finished") {
+      finishToolCard(event.data?.tool_call_id, event.data);
+    }
     if (event.type === "approval.requested") showApprovalRequest(event.data, approvalDecisions.get(event.data?.approval_id));
   }
   if (!assistantTextCount && snapshot.final_text) appendAgentText(snapshot.final_text, "历史");
@@ -660,7 +670,7 @@ function connectEventStream() {
 }
 
 function approvalDecisionLabel(decision) {
-  return ({ approve_once: "已允许一次", deny: "已拒绝", cancel_task: "已取消任务", submitting: "正在提交…" })[decision] || "等待你的决定";
+  return ({ approve_once: "已允许一次", deny: "已拒绝", cancel_task: "已取消任务", submitting: "正在提交…", submitted: "已提交，等待执行", syncing: "正在校准状态…" })[decision] || "等待你的决定";
 }
 
 function updateApprovalCard(card, decision) {
@@ -868,10 +878,47 @@ async function submitApproval(approvalId, decision) {
     await api(`/api/sessions/${backendState.sessionId}/approvals/${approvalId}`, {
       method: "POST", body: JSON.stringify({ decision: apiDecision })
     });
-    updateApprovalCard(card, apiDecision);
+    // The POST only acknowledges delivery. Show approval only after the worker
+    // emits approval.decided through the event stream.
+    updateApprovalCard(card, "submitted");
+    window.setTimeout(() => reconcileApprovalState(backendState.sessionId, approvalId), 350);
   } catch (error) {
     updateApprovalCard(card, null);
     showToast(`审批提交失败：${safeErrorMessage(error)}`);
+  }
+}
+
+async function reconcileApprovalState(sessionId, approvalId, attempt = 0) {
+  if (!sessionId || backendState.sessionId !== sessionId || !backendState.activeTask) return;
+  try {
+    const snapshot = await api("/api/sessions/" + sessionId);
+    if (backendState.sessionId !== sessionId) return;
+    const events = snapshot.events || [];
+    const request = events.find(
+      (event) => event.type === "approval.requested" && event.data?.approval_id === approvalId
+    );
+    const toolCallId = request?.data?.tool_call_id;
+    const confirmed = events.some(
+      (event) => event.type === "approval.decided" && event.data?.approval_id === approvalId
+    );
+    const toolProgressed = Boolean(toolCallId) && events.some(
+      (event) => ["tool.started", "tool.finished"].includes(event.type)
+        && event.data?.tool_call_id === toolCallId
+    );
+    if (confirmed || toolProgressed || snapshot.status !== "waiting_approval") {
+      backendState.source?.close();
+      backendState.activeTask = ["running", "waiting_approval"].includes(snapshot.status);
+      renderSnapshot(snapshot);
+      if (backendState.activeTask) connectEventStream();
+      return;
+    }
+    updateApprovalCard(backendState.approvalCards.get(approvalId), "syncing");
+  } catch {
+    // A transient snapshot failure is retried below while this task remains active.
+  }
+  if (backendState.sessionId === sessionId && backendState.activeTask) {
+    const delay = attempt < 4 ? 500 * (attempt + 1) : 3000;
+    window.setTimeout(() => reconcileApprovalState(sessionId, approvalId, attempt + 1), delay);
   }
 }
 

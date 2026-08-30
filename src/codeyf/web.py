@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
+import socket
 import threading
 import time
 import urllib.parse
@@ -278,7 +280,9 @@ class CodeYFRequestHandler(BaseHTTPRequestHandler):
             return
         if action == "approvals" and len(parts) == 5:
             decision = body.get("decision")
-            if not isinstance(decision, str) or not self.app.service.approvals.resolve(parts[4], decision):
+            if not isinstance(decision, str) or not self.app.service.approvals.resolve(
+                parts[4], decision, session.id
+            ):
                 self._error(HTTPStatus.CONFLICT, "APPROVAL_NOT_PENDING", "审批不存在、已结束或决定无效")
                 return
             self._json({"accepted": True})
@@ -364,6 +368,12 @@ class CodeYFRequestHandler(BaseHTTPRequestHandler):
 
 class CodeYFHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def __init__(self, address: tuple[str, int], service: AgentService, frontend_dir: Path, verbose: bool = False) -> None:
         super().__init__(address, CodeYFRequestHandler)

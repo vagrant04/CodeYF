@@ -86,6 +86,14 @@ class SecurityPolicy:
         (re.compile(r"\b(mkfs|diskpart|format\.com|bcdedit)\b", re.I), "CMD_DISK_CONTROL"),
         (re.compile(r"\b(reg\s+delete|deluser|userdel)\b", re.I), "CMD_SYSTEM_MUTATION"),
         (re.compile(r"\b(cat|type|copy)\b.*(\.ssh|credentials|id_rsa|\.env)(\b|[/\\])", re.I), "CMD_CREDENTIAL_READ"),
+        (
+            re.compile(
+                r"\b(cmd(?:\.exe)?\s+/[cs]|powershell(?:\.exe)?|pwsh(?:\.exe)?)\b"
+                r".*(?:>|out-file|set-content|add-content|new-item)",
+                re.I,
+            ),
+            "CMD_FILE_WRITE_BYPASS",
+        ),
     )
     ASK_PATTERNS = (
         (re.compile(r"\b(rm|rmdir|del|remove-item)\b", re.I), "CMD_DELETE"),
@@ -105,7 +113,9 @@ class SecurityPolicy:
             return RiskAssessment(PolicyDecision.ALLOW, "low", (), "只读工作区操作")
         if tool_name == "apply_patch":
             patch = str(arguments.get("patch", ""))
-            deleting = "*** Delete File:" in patch
+            deleting = "*** Delete File:" in patch or bool(
+                re.search(r"(?m)^\+\+\+\s+/dev/null(?:\s|$)", patch)
+            )
             if self.mode == "strict" or deleting:
                 return RiskAssessment(PolicyDecision.ASK, "medium", ("FILE_WRITE",), "修改工作区文件")
             return RiskAssessment(PolicyDecision.ALLOW, "medium", ("FILE_WRITE",), "修改工作区文件")
@@ -136,15 +146,23 @@ class SecurityPolicy:
 
 
 class ApprovalProvider(Protocol):
+    def prepare(self, request: dict[str, Any]) -> None: ...
+
     def decide(self, request: dict[str, Any], timeout: float | None = None) -> str: ...
 
 
 class AutoDenyApproval:
+    def prepare(self, request: dict[str, Any]) -> None:
+        return None
+
     def decide(self, request: dict[str, Any], timeout: float | None = None) -> str:
         return "deny"
 
 
 class ConsoleApproval:
+    def prepare(self, request: dict[str, Any]) -> None:
+        return None
+
     def decide(self, request: dict[str, Any], timeout: float | None = None) -> str:
         print("\n需要确认：", request["summary"])
         print("工具：", request["tool_name"])
@@ -171,23 +189,31 @@ class ApprovalBroker:
         self._pending: dict[str, _PendingApproval] = {}
         self._lock = threading.RLock()
 
-    def decide(self, request: dict[str, Any], timeout: float | None = 300.0) -> str:
-        pending = _PendingApproval(request)
+    def prepare(self, request: dict[str, Any]) -> None:
+        """Register before publishing approval.requested so fast clicks cannot be lost."""
         approval_id = request["approval_id"]
         with self._lock:
-            self._pending[approval_id] = pending
+            self._pending.setdefault(approval_id, _PendingApproval(request))
+
+    def decide(self, request: dict[str, Any], timeout: float | None = 300.0) -> str:
+        approval_id = request["approval_id"]
+        with self._lock:
+            pending = self._pending.setdefault(approval_id, _PendingApproval(request))
         with pending.condition:
             pending.condition.wait_for(lambda: pending.decision is not None, timeout=timeout)
         with self._lock:
-            self._pending.pop(approval_id, None)
+            if self._pending.get(approval_id) is pending:
+                self._pending.pop(approval_id, None)
         return pending.decision or "deny"
 
-    def resolve(self, approval_id: str, decision: str) -> bool:
+    def resolve(self, approval_id: str, decision: str, session_id: str | None = None) -> bool:
         if decision not in {"approve_once", "deny", "cancel_task"}:
             return False
         with self._lock:
             pending = self._pending.get(approval_id)
         if pending is None:
+            return False
+        if session_id is not None and pending.request.get("session_id") != session_id:
             return False
         with pending.condition:
             pending.decision = decision

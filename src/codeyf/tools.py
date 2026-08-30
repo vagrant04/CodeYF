@@ -4,7 +4,9 @@ import fnmatch
 import hashlib
 import json
 import os
+import platform
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -319,7 +321,7 @@ class _PatchOperation:
     body: list[str]
 
 
-def _parse_patch(patch: str) -> list[_PatchOperation]:
+def _parse_legacy_patch(patch: str) -> list[_PatchOperation]:
     lines = patch.replace("\r\n", "\n").split("\n")
     if not lines or lines[0] != "*** Begin Patch" or "*** End Patch" not in lines:
         raise ValueError("补丁必须由 *** Begin Patch 和 *** End Patch 包围")
@@ -342,12 +344,192 @@ def _parse_patch(patch: str) -> list[_PatchOperation]:
     raise ValueError("补丁缺少结束标记")
 
 
+PATCH_MARKER = "*" * 3
+PATCH_BEGIN = PATCH_MARKER + " Begin Patch"
+PATCH_END = PATCH_MARKER + " End Patch"
+PATCH_CORRECTION_EXAMPLE = "\n".join((
+    PATCH_BEGIN,
+    PATCH_MARKER + " Add File: config.h",
+    "+#pragma once",
+    "+#define APP_NAME CodeYF",
+    PATCH_END,
+))
+
+
+def _patch_lines(patch: str) -> list[str]:
+    lines = patch.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and lines[0] == PATCH_BEGIN:
+        if lines[-1] != PATCH_END:
+            raise ValueError("CodeYF 补丁开始标记必须有对应的结束标记")
+        return lines[1:-1]
+    return lines
+
+
+def _detect_patch_format(patch: str) -> str:
+    normalized = patch.replace("\r\n", "\n").replace("\r", "\n")
+    if re.search(r"(?m)^\*\*\* (?:Add|Update|Delete) File:", normalized):
+        return "codeyf_native"
+    if re.search(r"(?m)^diff --git ", normalized) or (
+        re.search(r"(?m)^--- ", normalized) and re.search(r"(?m)^\+\+\+ ", normalized)
+    ):
+        return "unified_diff"
+    if normalized.lstrip().startswith(PATCH_BEGIN):
+        return "wrapped_unknown"
+    return "unknown"
+
+
+def _parse_native_patch(lines: list[str]) -> list[_PatchOperation]:
+    operations: list[_PatchOperation] = []
+    current: _PatchOperation | None = None
+    for line in lines:
+        match = re.match(r"\*\*\* (Update|Add|Delete) File: (.+)$", line)
+        if match:
+            if current:
+                operations.append(current)
+            current = _PatchOperation(match.group(1).lower(), match.group(2).strip(), [])
+        elif current is not None:
+            current.body.append(line)
+        elif line.strip():
+            raise ValueError("文件声明前存在补丁内容")
+    if current:
+        operations.append(current)
+    if not operations:
+        raise ValueError("补丁不包含文件操作")
+    return operations
+
+
+def _unified_path(header: str, marker: str) -> str | None:
+    raw = header[len(marker):].strip()
+    if not raw:
+        raise ValueError(f"{marker.strip()} 文件头缺少路径")
+    raw = raw.split("\t", 1)[0].strip()
+    if raw == "/dev/null":
+        return None
+    if raw.startswith('"') or raw.endswith('"'):
+        raise ValueError("暂不支持带引号的 unified diff 路径；请改用 CodeYF 原生格式")
+    if raw.startswith(("a/", "b/")):
+        raw = raw[2:]
+    if not raw:
+        raise ValueError("unified diff 文件路径不能为空")
+    return raw
+
+
+def _normalize_unified_add(body: list[str]) -> list[str]:
+    result: list[str] = []
+    saw_hunk = False
+    for line in body:
+        if line.startswith("@@"):
+            saw_hunk = True
+            continue
+        if line == r"\ No newline at end of file":
+            continue
+        if not saw_hunk:
+            if not line.strip():
+                continue
+            raise ValueError("unified diff 文件内容前缺少 @@ hunk")
+        if line.startswith("+"):
+            result.append(line)
+        elif line.startswith((" ", "-")):
+            raise ValueError("从 /dev/null 新增文件的 hunk 只能包含 + 内容行")
+        elif line.strip():
+            raise ValueError("unified diff hunk 行必须以空格、+ 或 - 开头")
+    if not saw_hunk:
+        raise ValueError("unified diff 至少需要一个 @@ hunk")
+    return result
+
+
+def _parse_unified_patch(lines: list[str]) -> list[_PatchOperation]:
+    operations: list[_PatchOperation] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("--- ") and index + 1 < len(lines) and lines[index + 1].startswith("+++ "):
+            old_path = _unified_path(line, "--- ")
+            new_path = _unified_path(lines[index + 1], "+++ ")
+            index += 2
+            body: list[str] = []
+            while index < len(lines):
+                if lines[index].startswith("diff --git "):
+                    break
+                if (
+                    lines[index].startswith("--- ")
+                    and index + 1 < len(lines)
+                    and lines[index + 1].startswith("+++ ")
+                ):
+                    break
+                body.append(lines[index])
+                index += 1
+            if old_path is None and new_path is None:
+                raise ValueError("unified diff 的新旧路径不能同时为 /dev/null")
+            if old_path is None:
+                action = "add"
+                target = new_path
+                body = _normalize_unified_add(body)
+            elif new_path is None:
+                action = "delete"
+                target = old_path
+            else:
+                if old_path != new_path:
+                    raise ValueError("不支持通过 unified diff 重命名文件；请拆分为删除和新增")
+                action = "update"
+                target = new_path
+            if not any(item.startswith("@@") for item in body) and action != "add":
+                raise ValueError("unified diff 至少需要一个 @@ hunk")
+            operations.append(_PatchOperation(action, target or "", body))
+            continue
+        if line.startswith(("diff --git ", "index ", "new file mode ", "deleted file mode ")):
+            index += 1
+            continue
+        if not line.strip():
+            index += 1
+            continue
+        raise ValueError(f"无法识别 unified diff 行: {line[:120]}")
+    if not operations:
+        raise ValueError("unified diff 不包含 ---/+++ 文件头")
+    return operations
+
+
+def _parse_patch(patch: str) -> list[_PatchOperation]:
+    lines = _patch_lines(patch)
+    detected = _detect_patch_format(patch)
+    if detected == "codeyf_native":
+        return _parse_native_patch(lines)
+    if detected == "unified_diff":
+        return _parse_unified_patch(lines)
+    raise ValueError("未识别到 CodeYF 文件声明或 unified diff 的 ---/+++ 文件头")
+
+
+def _patch_parse_error(patch: str, error: Exception) -> ToolResult:
+    detected = _detect_patch_format(patch)
+    message = (
+        f"{error}；实际识别格式: {detected}。"
+        "请使用 CodeYF 原生的 Add/Update/Delete File 格式，"
+        "或包含 ---、+++、@@ 的 unified diff。"
+    )
+    return _error(
+        "PATCH_PARSE_ERROR",
+        message,
+        retryable=True,
+        details={
+            "expected_formats": ["codeyf_native", "unified_diff"],
+            "detected_format": detected,
+            "correction_example": PATCH_CORRECTION_EXAMPLE,
+        },
+    )
+
+
 def _apply_update(original: str, body: list[str]) -> str:
     source = original.splitlines()
     trailing_newline = original.endswith("\n")
     hunks: list[list[str]] = []
     current: list[str] = []
     for line in body:
+        if line == r"\ No newline at end of file":
+            continue
         if line.startswith("@@"):
             if current:
                 hunks.append(current)
@@ -381,10 +563,22 @@ def _apply_update(original: str, body: list[str]) -> str:
 class ApplyPatchTool:
     guard: PathGuard
     name = "apply_patch"
-    description = "用确定性的补丁创建、更新或删除工作区文本文件。上下文不匹配时整个调用失败。"
+    description = (
+        "以原子方式创建、更新或删除工作区文本文件。patch 可使用 CodeYF 原生格式"
+        "（Add/Update/Delete File）或常见 unified diff（---/+++ 与 @@）；"
+        "路径必须相对工作区，禁止绝对路径和 ..。不要用 run_command 或 shell 重定向代替此工具写文件。"
+    )
     input_schema = {
         "type": "object",
-        "properties": {"patch": {"type": "string"}},
+        "properties": {
+            "patch": {
+                "type": "string",
+                "description": (
+                    "CodeYF 原生补丁或 unified diff。新增文件可使用 "
+                    "'--- /dev/null'、'+++ path' 和 '@@ -0,0 +1,N @@'。"
+                ),
+            }
+        },
         "required": ["patch"],
         "additionalProperties": False,
     }
@@ -396,16 +590,26 @@ class ApplyPatchTool:
         try:
             operations = _parse_patch(patch)
         except ValueError as exc:
-            return _error("PATCH_PARSE_ERROR", str(exc), retryable=True)
+            return _patch_parse_error(patch, exc)
         staged: list[tuple[_PatchOperation, Path, str | None, bytes | None]] = []
+        targets: set[str] = set()
         try:
             for operation in operations:
+                raw_path = Path(operation.path)
+                if raw_path.is_absolute() or ".." in raw_path.parts:
+                    raise PathSecurityError("补丁路径必须是工作区内不含 .. 的相对路径")
                 path = self.guard.resolve(operation.path)
+                target_key = os.path.normcase(str(path))
+                if target_key in targets:
+                    raise ValueError(f"同一补丁不能多次操作同一路径: {operation.path}")
+                targets.add(target_key)
                 before = path.read_bytes() if path.exists() else None
                 if operation.action == "add":
                     if path.exists():
                         raise FileExistsError(operation.path)
                     content = "\n".join(line[1:] if line.startswith("+") else line for line in operation.body)
+                    if operation.body and operation.body[-1] == "+":
+                        content += "\n"
                     if content and not content.endswith("\n"):
                         content += "\n"
                     staged.append((operation, path, content, before))
@@ -430,16 +634,20 @@ class ApplyPatchTool:
         except LookupError as exc:
             return _error("PATCH_CONTEXT_MISMATCH", str(exc), retryable=True)
         except ValueError as exc:
-            return _error("PATCH_PARSE_ERROR", str(exc), retryable=True)
+            return _patch_parse_error(patch, exc)
         except OSError as exc:
             return _error("TOOL_IO_ERROR", f"准备补丁失败: {exc}")
 
         changes: list[dict[str, Any]] = []
         applied: list[tuple[Path, bytes | None]] = []
         try:
-            for operation, path, content, before in staged:
-                if before is not None and (not path.exists() or path.read_bytes() != before):
+            for operation, path, _content, before in staged:
+                if before is None:
+                    if path.exists():
+                        return _error("FILE_CHANGED", f"文件在补丁应用前发生变化: {operation.path}", retryable=True)
+                elif not path.exists() or path.read_bytes() != before:
                     return _error("FILE_CHANGED", f"文件在补丁应用前发生变化: {operation.path}", retryable=True)
+            for operation, path, content, before in staged:
                 if operation.action == "delete":
                     path.unlink()
                     applied.append((path, before))
@@ -482,7 +690,7 @@ class RunCommandTool:
     tool_config: ToolConfig
     security_config: SecurityConfig
     name = "run_command"
-    description = "在工作区子目录运行命令并返回 stdout、stderr、退出码和超时状态。优先使用 argv，避免 shell。"
+    description = "在当前宿主操作系统的工作区子目录运行已安装命令，并返回 stdout、stderr、退出码和超时状态。优先使用 argv，避免 shell；不要假定 Linux 命令存在。"
     input_schema = {
         "type": "object",
         "properties": {
@@ -495,6 +703,37 @@ class RunCommandTool:
         },
         "additionalProperties": False,
     }
+
+    def preflight(self, arguments: dict[str, Any], session: AgentSession) -> ToolResult | None:
+        """Reject missing argv executables before policy/approval is evaluated."""
+        argv = arguments.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
+            return None
+        executable = argv[0].strip()
+        if not executable:
+            return None
+        cwd_value = arguments.get("cwd", ".")
+        try:
+            cwd = self.guard.resolve(cwd_value, must_exist=True)
+        except (PathSecurityError, FileNotFoundError):
+            return None
+        environment_path = os.environ.get("PATH") if "PATH" in self.security_config.inherit_environment else None
+        has_path_part = Path(executable).is_absolute() or any(separator in executable for separator in ("/", "\\"))
+        if has_path_part:
+            candidate = Path(executable)
+            if not candidate.is_absolute():
+                candidate = cwd / candidate
+            found = candidate.is_file()
+        else:
+            found = shutil.which(executable, path=environment_path) is not None
+        if found:
+            return None
+        host = platform.system() or os.name
+        return _error(
+            "COMMAND_NOT_FOUND",
+            f"当前 {host} 环境找不到命令: {executable}。请只使用运行环境列出的可用命令；不要改用其他操作系统的命令。",
+            details={"executable": executable, "platform": host},
+        )
 
     def execute(self, arguments: dict[str, Any], session: AgentSession) -> ToolResult:
         argv = arguments.get("argv")
@@ -600,6 +839,11 @@ class ToolDispatcher:
         if validation_error:
             result = _error("INVALID_ARGUMENT", validation_error, retryable=True)
             return self._finish(call, session, result, started, "not_required")
+        preflight = getattr(tool, "preflight", None)
+        if callable(preflight):
+            preflight_result = preflight(call.arguments, session)
+            if preflight_result is not None:
+                return self._finish(call, session, preflight_result, started, "not_required")
         assessment = self.policy.assess(call.name, call.arguments)
         if assessment.decision == PolicyDecision.DENY:
             result = _error("POLICY_DENIED", assessment.summary, details={"rule_ids": list(assessment.rule_ids)})
@@ -619,6 +863,7 @@ class ToolDispatcher:
                 "argument_hash": canonical_call_hash(call.name, call.arguments),
             }
             session.transition(SessionStatus.WAITING_APPROVAL, "approval_required")
+            self.approvals.prepare(request)
             session.emit("approval.requested", request, call.id)
             decision = self.approvals.decide(request)
             session.emit("approval.decided", {"approval_id": approval_id, "decision": decision}, call.id)

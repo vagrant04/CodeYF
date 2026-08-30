@@ -373,6 +373,7 @@ kbd { min-width: 20px; padding: 2px 4px; border: 1px solid var(--line); border-b
 .approval-rail-icon svg { width: 16px; height: 16px; }
 .approval-status { color: var(--yellow) !important; }
 .approval-status.approve_once { color: var(--green) !important; }
+.approval-status.submitted, .approval-status.syncing { color: var(--text-soft) !important; }
 .approval-status.deny, .approval-status.cancel_task { color: var(--red) !important; }
 .inline-approval { margin-top: 7px; padding: 15px; border: 1px solid color-mix(in srgb, var(--yellow) 42%, var(--line)); border-radius: 11px; background: color-mix(in srgb, #f7ead2 34%, var(--surface-strong)); box-shadow: var(--shadow-sm); }
 [data-theme="dark"] .inline-approval { background: color-mix(in srgb, var(--yellow) 8%, var(--surface-strong)); }

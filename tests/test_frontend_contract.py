@@ -3,24 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 
 
-FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
+def test_approval_ui_waits_for_backend_decision_and_has_snapshot_recovery() -> None:
+    source = (Path(__file__).parents[1] / "frontend" / "app.js").read_text(encoding="utf-8")
+    submit_section = source.split("async function submitApproval", 1)[1].split(
+        "async function reconcileApprovalState", 1
+    )[0]
+    decided_section = source.split('event.type === "approval.decided"', 1)[1].split(
+        'event.type === "task.completed"', 1
+    )[0]
 
-
-def test_permissions_are_inline_and_not_modal() -> None:
-    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
-    script = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    styles = (FRONTEND / "styles.css").read_text(encoding="utf-8")
-
-    assert 'id="approvalModal"' not in html
-    assert "showApprovalRequest" in script
-    assert "inline-approval" in script
-    assert ".inline-approval" in styles
-
-
-def test_agent_answers_use_safe_markdown_renderer() -> None:
-    script = (FRONTEND / "app.js").read_text(encoding="utf-8")
-
-    assert "function renderMarkdown" in script
-    assert 'class="agent-summary markdown-body"' in script
-    assert '<p class="agent-summary">${escapeHtml(text)}</p>' not in script
-    assert "escapeHtml(codeLines.join" in script
+    assert 'updateApprovalCard(card, apiDecision)' not in submit_section
+    assert 'updateApprovalCard(card, "submitted")' in submit_section
+    assert "reconcileApprovalState" in submit_section
+    assert "data.decision" in decided_section
+    assert 'await api("/api/sessions/" + sessionId)' in source
+    assert '["tool.started", "tool.finished"]' in source

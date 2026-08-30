@@ -3,6 +3,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import platform
+import shutil
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +28,44 @@ SYSTEM_PROMPT = """你是 CodeYF，一个运行在用户本机的编程智能体
 5. 路径一律相对逻辑工作区根；优先用 argv 形式运行命令，除非确实需要 shell。
 6. 完成时直接返回最终文本，不调用额外完成工具。最终文本说明结论、修改、验证和未解决问题。
 7. 不输出隐藏思维过程；可以简洁说明计划、观察与证据。
+8. 创建、更新或删除文件必须优先使用 apply_patch；不得用 cmd、PowerShell、重定向或管道绕过文件工具。
+9. apply_patch 接受 CodeYF 原生 Add/Update/Delete File 格式，也接受带 ---、+++、@@ 的 unified diff。
+   如果收到 PATCH_PARSE_ERROR，必须根据 error.details 中的 detected_format 和 correction_example 改正格式，
+   不得原样重复同一失败补丁。
+"""
+
+RUNTIME_COMMAND_CANDIDATES = (
+    "python", "py", "python3", "node", "npm", "git", "rg", "pytest",
+    "cl", "clang", "clang++", "gcc", "g++", "cc", "cmake", "ninja",
+    "dotnet", "cargo", "go", "java", "javac", "mvn", "gradle",
+)
+
+
+def build_system_prompt() -> str:
+    """Describe locally detected capabilities so the model does not guess Linux tools on Windows."""
+    host = platform.system() or os.name
+    release = platform.release()
+    available = [command for command in RUNTIME_COMMAND_CANDIDATES if shutil.which(command)]
+    missing_compilers = [
+        command for command in ("cl", "clang", "clang++", "gcc", "g++", "cc")
+        if command not in available
+    ]
+    available_text = ", ".join(available) if available else "（未探测到候选命令）"
+    compiler_text = ", ".join(missing_compilers) if missing_compilers else "无"
+    shell_note = (
+        "这是 Windows 宿主。不得使用 bash/Linux 专用命令、路径或 shell 语法；"
+        "仅使用下方实际可用的命令。"
+        if host.casefold() == "windows"
+        else "仅使用下方实际可用的命令，不要假定其他操作系统的工具存在。"
+    )
+    return SYSTEM_PROMPT + f"""
+
+运行环境（由 CodeYF 启动时在本机探测）：
+- 操作系统：{host} {release}
+- 可用候选命令：{available_text}
+- 未安装的常见 C/C++ 编译器：{compiler_text}
+- {shell_note}
+- 如果任务所需的编译器或运行时未安装，明确说明未执行该项验证，不要连续猜测替代命令。
 """
 
 
@@ -167,7 +208,7 @@ class AgentLoop:
         if session.status == SessionStatus.RUNNING:
             raise RuntimeError("会话已有任务在运行")
         if not session.messages:
-            session.messages.append({"role": "system", "content": SYSTEM_PROMPT})
+            session.messages.append({"role": "system", "content": build_system_prompt()})
         session.messages.append({"role": "user", "content": user_text})
         session.turn_count = 0
         session.tool_call_count = 0
