@@ -10,6 +10,7 @@ const runStateText = $("#runStateText");
 const workspaceModal = $("#workspaceModal");
 const commandPalette = $("#commandPalette");
 const paletteInput = $("#paletteInput");
+const modeMenu = $("#modeMenu");
 
 const backendState = {
   available: false,
@@ -27,11 +28,63 @@ const backendState = {
   usage: null,
   sessions: [],
   workspaces: [],
-  selectedWorkspace: null
+  selectedWorkspace: null,
+  projects: [],
+  selectedProject: null,
+  editingProjectId: null,
+  selectedApprovalMode: null,
+  restoringSnapshot: false,
+  renderedAssistantEvents: new Set(),
+  lastAssistantText: "",
+  watchdogTimer: null
 };
 
 function icon(id) {
   return `<svg aria-hidden="true"><use href="#${id}"></use></svg>`;
+}
+
+const approvalModeLabels = { strict: "严格", balanced: "平衡", auto: "完全访问" };
+
+function renderApprovalMode() {
+  const mode = backendState.selectedApprovalMode || "balanced";
+  const button = $("#modeButton");
+  $("span", button).textContent = `Agent · ${approvalModeLabels[mode] || "平衡"}`;
+  button.dataset.mode = mode;
+  $("#composerHint").textContent = mode === "auto"
+    ? "完全访问已启用：命令将自动运行。请检查 diff；工作区边界和危险命令硬阻止仍然生效。"
+    : "CodeYF 可能出错。应用修改前请检查 diff，重要操作会请求确认。";
+  $$("[data-approval-mode]", modeMenu).forEach((item) => {
+    item.setAttribute("aria-checked", String(item.dataset.approvalMode === mode));
+  });
+}
+
+function closeModeMenu() {
+  modeMenu.hidden = true;
+  $("#modeButton").setAttribute("aria-expanded", "false");
+}
+
+async function selectApprovalMode(mode) {
+  if (!["strict", "balanced", "auto"].includes(mode)) return;
+  if (backendState.activeTask) {
+    closeModeMenu();
+    showToast("任务运行期间不能切换权限模式");
+    return;
+  }
+  try {
+    if (backendState.sessionId) {
+      await api(`/api/sessions/${backendState.sessionId}/settings`, {
+        method: "POST",
+        body: JSON.stringify({ approval_mode: mode })
+      });
+    }
+    backendState.selectedApprovalMode = mode;
+    renderApprovalMode();
+    closeModeMenu();
+    showToast(mode === "auto" ? "已启用完全访问：命令将自动运行" : `权限模式已切换为${approvalModeLabels[mode]}`);
+  } catch (error) {
+    closeModeMenu();
+    showToast(error.message || "权限模式切换失败");
+  }
 }
 
 function escapeHtml(text) {
@@ -238,14 +291,17 @@ function appendUserMessage(text, meta = "刚刚") {
     <div class="user-avatar">YF</div>
     <div class="brief-content">
       <div class="message-meta"><strong>你</strong><span>${escapeHtml(meta)}</span></div>
-      <p>${escapeHtml(text)}</p>
+      <div class="user-prompt markdown-body">${renderMarkdown(text)}</div>
     </div>`;
   $(".conversation-inner").appendChild(block);
   scrollToBottom();
 }
 
-function appendAgentText(text, meta = "刚刚", cssClass = "") {
+function appendAgentText(text, meta = "刚刚", cssClass = "", eventKey = null) {
   if (!text) return;
+  if (eventKey && backendState.renderedAssistantEvents.has(eventKey)) return;
+  if (eventKey) backendState.renderedAssistantEvents.add(eventKey);
+  backendState.lastAssistantText = String(text).trim();
   $("#emptyState")?.remove();
   const block = document.createElement("article");
   block.className = `agent-turn backend-turn ${cssClass}`.trim();
@@ -337,6 +393,8 @@ function resetDetails() {
   backendState.changes.clear();
   backendState.commands = [];
   backendState.usage = null;
+  backendState.renderedAssistantEvents.clear();
+  backendState.lastAssistantText = "";
   renderChanges();
   renderTerminal();
   renderContext();
@@ -345,6 +403,27 @@ function resetDetails() {
 function fileBadge(path) {
   const suffix = path.includes(".") ? path.split(".").pop().slice(0, 4).toUpperCase() : "FILE";
   return suffix || "FILE";
+}
+
+function isHtmlFile(path) {
+  return /\.html?$/i.test(String(path || ""));
+}
+
+function setEditorView(mode, path = $("#changeTree .tree-file.selected")?.dataset.file) {
+  const html = isHtmlFile(path);
+  const selectedMode = html && mode === "preview" ? "preview" : "code";
+  const editor = $("#codeEditor");
+  const preview = $("#htmlPreview");
+  editor.hidden = selectedMode === "preview";
+  preview.hidden = selectedMode !== "preview";
+  $$("[data-editor-view]", $("#editorViewSwitch")).forEach((button) => {
+    button.classList.toggle("active", button.dataset.editorView === selectedMode);
+  });
+  if (selectedMode === "preview" && backendState.sessionId && path) {
+    preview.src = `/api/sessions/${backendState.sessionId}/html-preview?path=${encodeURIComponent(path)}&v=${Date.now()}`;
+  } else if (!html) {
+    preview.removeAttribute("src");
+  }
 }
 
 function renderChanges() {
@@ -360,6 +439,10 @@ function renderChanges() {
     $("#editorFileName").textContent = "未选择文件";
     $("#editorBadge").textContent = "FILE";
     $("#codeEditor").innerHTML = '<div class="panel-empty">应用补丁后，可在此查看磁盘上的真实文件内容。</div>';
+    $("#codeEditor").hidden = false;
+    $("#htmlPreview").hidden = true;
+    $("#htmlPreview").removeAttribute("src");
+    $("#editorViewSwitch").hidden = true;
     return;
   }
   tree.innerHTML = changes.map((change, index) => `
@@ -377,6 +460,8 @@ async function loadFilePreview(path) {
   $$(".tree-file", $("#changeTree")).forEach((button) => button.classList.toggle("selected", button.dataset.file === path));
   $("#editorFileName").textContent = path;
   $("#editorBadge").textContent = fileBadge(path);
+  const html = isHtmlFile(path);
+  $("#editorViewSwitch").hidden = !html;
   const editor = $("#codeEditor");
   editor.innerHTML = '<div class="panel-empty">正在读取磁盘文件…</div>';
   try {
@@ -384,7 +469,9 @@ async function loadFilePreview(path) {
     const lines = file.content.split(/\r?\n/);
     if (lines.at(-1) === "") lines.pop();
     editor.innerHTML = lines.map((line, index) => `<div class="code-line"><span>${index + 1}</span><code>${escapeHtml(line)}</code></div>`).join("") || '<div class="panel-empty">文件为空</div>';
+    setEditorView(html ? "preview" : "code", path);
   } catch (error) {
+    setEditorView("code", path);
     editor.innerHTML = `<div class="panel-empty">${escapeHtml(error.code === "PATH_NOT_FOUND" ? "文件已被真实删除" : safeErrorMessage(error))}</div>`;
   }
 }
@@ -419,69 +506,68 @@ function renderContext() {
 
 function renderSessions() {
   const nav = $("#taskNav");
-  if (!backendState.sessions.length) {
-    nav.innerHTML = '<div class="nav-empty">暂无真实会话</div>';
-    $("#paletteSessions").innerHTML = '<div class="nav-empty">暂无真实会话</div>';
+  if (!backendState.projects.length) {
+    nav.innerHTML = '<div class="nav-empty">暂无项目</div>';
+    $("#paletteSessions").innerHTML = '<div class="nav-empty">暂无会话</div>';
     return;
   }
-  const items = backendState.sessions.map((session) => {
-    const workspaceName = String(session.workspace || "").split(/[\\/]/).filter(Boolean).at(-1) || "未指定工作区";
-    return `
-    <button class="task-item ${session.session_id === backendState.sessionId ? "active" : ""}" data-session="${session.session_id}">
-      <span class="task-status ${statusClass(session.status)}"></span>
-      <span class="task-copy"><strong>${escapeHtml(shortTitle(session.title))}</strong><small>${escapeHtml(workspaceName)} · ${escapeHtml(statusLabel(session.status))} · ${session.tool_call_count || 0} 次工具</small></span>
-      <span class="task-time">${escapeHtml(relativeTime(session.updated_at))}</span>
-    </button>`;
+  nav.innerHTML = backendState.projects.map((project) => {
+    const projectSessions = backendState.sessions.filter((session) => session.project_id === project.project_id);
+    const items = projectSessions.map((session) => `
+      <button class="task-item ${session.session_id === backendState.sessionId ? "active" : ""}" data-session="${session.session_id}">
+        <span class="task-status ${statusClass(session.status)}"></span>
+        <span class="task-copy"><strong>${escapeHtml(shortTitle(session.title))}</strong><small>${escapeHtml(statusLabel(session.status))} · ${session.tool_call_count || 0} 次工具</small></span>
+        <span class="task-time">${escapeHtml(relativeTime(session.updated_at))}</span>
+      </button>`).join("");
+    return `<div class="nav-section project-section ${project.project_id === backendState.selectedProject?.project_id ? "selected" : ""}">
+      <button class="nav-heading project-heading" data-project-select="${project.project_id}">
+        <span>${escapeHtml(project.name)}</span><small>${projectSessions.length}</small>
+      </button>
+      ${items || '<div class="nav-empty compact">暂无会话</div>'}
+    </div>`;
   }).join("");
-  nav.innerHTML = `<div class="nav-section"><div class="nav-heading"><span>真实会话</span></div>${items}</div>`;
   $$("[data-session]", nav).forEach((button) => button.addEventListener("click", () => loadSession(button.dataset.session)));
+  $$("[data-project-select]", nav).forEach((button) => button.addEventListener("click", () => selectProject(button.dataset.projectSelect)));
   $("#paletteSessions").innerHTML = backendState.sessions.slice(0, 8).map((session) => `
-    <button data-session="${session.session_id}">${icon("i-clock")}<span><strong>${escapeHtml(shortTitle(session.title))}</strong><small>${escapeHtml(statusLabel(session.status))}</small></span></button>`).join("");
+    <button data-session="${session.session_id}">${icon("i-clock")}<span><strong>${escapeHtml(shortTitle(session.title))}</strong><small>${escapeHtml(statusLabel(session.status))}</small></span></button>`).join("") || '<div class="nav-empty">暂无会话</div>';
   $$("[data-session]", $("#paletteSessions")).forEach((button) => button.addEventListener("click", () => { loadSession(button.dataset.session); closePalette(); }));
 }
 
-function updateWorkspaceCard(workspace, persist = true) {
-  if (!workspace?.path) return;
-  backendState.selectedWorkspace = workspace;
-  $("#workspaceName").textContent = workspace.name || workspace.path.split(/[\\/]/).filter(Boolean).at(-1) || workspace.path;
-  $("#workspacePath").textContent = workspace.path;
-  $("#breadcrumbPath").textContent = workspace.path;
-  if (persist) localStorage.setItem("codeyf-workspace", workspace.path);
+function updateProjectCard(project, persist = true) {
+  if (!project?.project_id) return;
+  backendState.selectedProject = project;
+  backendState.selectedWorkspace = { path: project.workspace, name: project.name };
+  $("#workspaceName").textContent = project.name;
+  $("#workspacePath").textContent = project.workspace;
+  $("#breadcrumbPath").textContent = project.name;
+  if (persist) localStorage.setItem("codeyf-project", project.project_id);
   renderWorkspaceOptions();
+  renderSessions();
 }
 
 function renderWorkspaceOptions() {
   const list = $("#workspaceList");
-  if (!backendState.workspaces.length) {
-    list.innerHTML = '<div class="panel-empty">暂无最近工作区，可在下方输入路径</div>';
+  if (!backendState.projects.length) {
+    list.innerHTML = '<div class="panel-empty">暂无项目，可在下方创建</div>';
     return;
   }
-  list.innerHTML = backendState.workspaces.map((workspace) => `
-    <button class="workspace-option ${workspace.path === backendState.selectedWorkspace?.path ? "active" : ""}" data-workspace="${escapeHtml(workspace.path)}">
+  list.innerHTML = backendState.projects.map((project) => `
+    <button class="workspace-option ${project.project_id === backendState.selectedProject?.project_id ? "active" : ""}" data-project="${project.project_id}">
       ${icon("i-folder")}
-      <span><strong>${escapeHtml(workspace.name)}</strong><small>${escapeHtml(workspace.path)}</small></span>
-      <em>${workspace.path === backendState.selectedWorkspace?.path ? "当前" : workspace.is_default ? "默认" : ""}</em>
+      <span><strong>${escapeHtml(project.name)}</strong><small>${escapeHtml(project.workspace)} · ${project.session_count || 0} 个会话</small></span>
+      <em>${project.project_id === backendState.selectedProject?.project_id ? "当前" : project.is_default ? "默认" : ""}</em>
     </button>`).join("");
-  $$("[data-workspace]", list).forEach((button) => button.addEventListener("click", () => selectWorkspace(button.dataset.workspace)));
+  $$("[data-project]", list).forEach((button) => button.addEventListener("click", () => selectProject(button.dataset.project)));
 }
 
-async function loadWorkspaces() {
-  const payload = await api("/api/workspaces");
-  backendState.workspaces = payload.workspaces || [];
-  const stored = localStorage.getItem("codeyf-workspace");
-  let selected = stored ? backendState.workspaces.find((workspace) => workspace.path === stored) : null;
-  if (stored && !selected) {
-    try {
-      selected = await api("/api/workspaces/select", { method: "POST", body: JSON.stringify({ path: stored }) });
-      backendState.workspaces.push(selected);
-    } catch {
-      localStorage.removeItem("codeyf-workspace");
-    }
-  }
-  selected = selected
-    || backendState.workspaces.find((workspace) => workspace.path === payload.default)
-    || backendState.workspaces[0];
-  if (selected) updateWorkspaceCard(selected, false);
+async function loadProjects() {
+  const payload = await api("/api/projects");
+  backendState.projects = payload.projects || [];
+  const stored = localStorage.getItem("codeyf-project");
+  const selected = backendState.projects.find((project) => project.project_id === stored)
+    || backendState.projects.find((project) => project.project_id === payload.default_project_id)
+    || backendState.projects[0];
+  if (selected) updateProjectCard(selected, false);
 }
 
 function openWorkspaceModal() {
@@ -494,7 +580,7 @@ function openWorkspaceModal() {
     return;
   }
   renderWorkspaceOptions();
-  $("#workspaceInput").value = backendState.selectedWorkspace?.path || "";
+  beginEditProject(backendState.selectedProject);
   $("#workspaceError").textContent = "";
   workspaceModal.classList.add("open");
   workspaceModal.setAttribute("aria-hidden", "false");
@@ -506,19 +592,44 @@ function closeWorkspaceModal() {
   workspaceModal.setAttribute("aria-hidden", "true");
 }
 
-async function selectWorkspace(path) {
-  const clean = String(path || "").trim();
-  if (!clean) {
-    $("#workspaceError").textContent = "请输入本机目录的绝对路径";
+function beginEditProject(project = null) {
+  backendState.editingProjectId = project?.project_id || null;
+  $("#projectFormTitle").textContent = project ? "编辑当前项目" : "创建新项目";
+  $("#projectNameInput").value = project?.name || "";
+  $("#workspaceInput").value = project?.workspace || "";
+  $("#workspaceInput").disabled = Boolean(project);
+  $("#projectMemoryInput").value = project?.memory || "";
+  $("#projectFormSubmit").textContent = project ? "保存项目" : "创建项目";
+}
+
+async function selectProject(projectId, startFresh = true) {
+  const project = backendState.projects.find((item) => item.project_id === projectId);
+  if (!project) return;
+  updateProjectCard(project, true);
+  closeWorkspaceModal();
+  if (startFresh) startNewTask(false);
+}
+
+async function saveProjectForm() {
+  const name = $("#projectNameInput").value.trim();
+  const workspace = $("#workspaceInput").value.trim();
+  const memory = $("#projectMemoryInput").value;
+  if (!name || !workspace) {
+    $("#workspaceError").textContent = "项目名称和工作区不能为空";
     return;
   }
   try {
-    const workspace = await api("/api/workspaces/select", { method: "POST", body: JSON.stringify({ path: clean }) });
-    if (!backendState.workspaces.some((item) => item.path === workspace.path)) backendState.workspaces.push(workspace);
-    updateWorkspaceCard(workspace, true);
+    const editing = backendState.editingProjectId;
+    const project = await api(editing ? "/api/projects/" + editing : "/api/projects", {
+      method: "POST",
+      body: JSON.stringify(editing ? { name, memory } : { name, workspace, memory })
+    });
+    await loadProjects();
+    const selected = backendState.projects.find((item) => item.project_id === project.project_id);
+    if (selected) updateProjectCard(selected, true);
     closeWorkspaceModal();
     startNewTask(false);
-    showToast(`已切换工作区：${workspace.name}`);
+    showToast(editing ? "项目设置已保存" : "项目已创建");
   } catch (error) {
     $("#workspaceError").textContent = safeErrorMessage(error);
   }
@@ -531,15 +642,28 @@ async function refreshSessions() {
   renderSessions();
 }
 
-function renderSnapshot(snapshot) {
+function renderSnapshot(snapshot, { preserveScroll = false } = {}) {
+  const previousScrollTop = conversation.scrollTop;
+  backendState.restoringSnapshot = true;
   backendState.snapshot = snapshot;
   backendState.lastSeq = Math.max(0, (snapshot.next_event_seq || 1) - 1);
   $(".conversation-inner").innerHTML = "";
   resetDetails();
   const callNames = new Map();
   let assistantTextCount = 0;
-  for (const message of snapshot.messages || []) {
-    if (message.role === "user") appendUserMessage(message.content, "历史");
+  const transcript = Array.isArray(snapshot.transcript) ? snapshot.transcript : [];
+  const hasTranscript = transcript.length > 0;
+  if (hasTranscript) {
+    for (const [entryIndex, entry] of transcript.entries()) {
+      if (entry.role === "user" && entry.content) appendUserMessage(entry.content, entry.recovered ? "历史 · 摘要恢复" : "历史");
+      if (entry.role === "assistant" && entry.content) {
+        appendAgentText(entry.content, "历史", "", "transcript-" + entryIndex);
+        assistantTextCount += 1;
+      }
+    }
+  }
+  for (const [messageIndex, message] of (snapshot.messages || []).entries()) {
+    if (!hasTranscript && message.role === "user") appendUserMessage(message.content, "历史");
     if (message.role === "assistant") {
       for (const call of message.tool_calls || []) {
         const name = call.function?.name || "tool";
@@ -548,8 +672,8 @@ function renderSnapshot(snapshot) {
         callNames.set(call.id, name);
         ensureToolCard(call.id, name, args);
       }
-      if (message.content) {
-        appendAgentText(message.content, "历史");
+      if (!hasTranscript && message.content) {
+        appendAgentText(message.content, "历史", "", "history-" + messageIndex);
         assistantTextCount += 1;
       }
     }
@@ -579,25 +703,27 @@ function renderSnapshot(snapshot) {
     }
     if (event.type === "approval.requested") showApprovalRequest(event.data, approvalDecisions.get(event.data?.approval_id));
   }
-  if (!assistantTextCount && snapshot.final_text) appendAgentText(snapshot.final_text, "历史");
-  if (!(snapshot.messages || []).some((message) => message.role === "user")) renderEmpty();
-  const firstUser = (snapshot.messages || []).find((message) => message.role === "user")?.content;
-  $("#threadTitle").textContent = shortTitle(firstUser || "新任务");
-  if (snapshot.workspace) {
-    const workspace = backendState.workspaces.find((item) => item.path === snapshot.workspace) || {
-      path: snapshot.workspace,
-      name: String(snapshot.workspace).split(/[\\/]/).filter(Boolean).at(-1) || snapshot.workspace,
-      is_default: false
-    };
-    if (!backendState.workspaces.some((item) => item.path === workspace.path)) backendState.workspaces.push(workspace);
-    updateWorkspaceCard(workspace, true);
-  }
+  if (!assistantTextCount && snapshot.final_text) appendAgentText(snapshot.final_text, "历史", "", "snapshot-final");
+  const hasConversation = hasTranscript
+    || (snapshot.messages || []).some((message) => message.role !== "system")
+    || Boolean(snapshot.final_text)
+    || (snapshot.events || []).some((event) => ["tool.requested", "tool.finished", "task.completed"].includes(event.type));
+  if (!hasConversation) renderEmpty();
+  const firstUser = transcript.find((entry) => entry.role === "user")?.content
+    || (snapshot.messages || []).find((message) => message.role === "user")?.content;
+  $("#threadTitle").textContent = shortTitle(snapshot.title || firstUser || "新任务");
+  const project = backendState.projects.find((item) => item.project_id === snapshot.project_id);
+  if (project) updateProjectCard(project, true);
   setRunState(statusLabel(snapshot.status), snapshot.status === "completed");
   if (snapshot.error) {
     appendAgentText(`任务失败：${safeErrorMessage(snapshot.error)}`, "失败", "error-turn");
   }
   renderContext();
-  scrollToBottom();
+  backendState.restoringSnapshot = false;
+  window.requestAnimationFrame(() => {
+    if (preserveScroll) conversation.scrollTop = previousScrollTop;
+    else conversation.scrollTop = conversation.scrollHeight;
+  });
 }
 
 async function loadSession(sessionId) {
@@ -606,6 +732,10 @@ async function loadSession(sessionId) {
   const snapshot = await api(`/api/sessions/${sessionId}`);
   backendState.sessionId = sessionId;
   backendState.activeTask = ["running", "waiting_approval"].includes(snapshot.status);
+  backendState.selectedApprovalMode = snapshot.approval_mode || backendState.selectedApprovalMode;
+  renderApprovalMode();
+  const project = backendState.projects.find((item) => item.project_id === snapshot.project_id);
+  if (project) updateProjectCard(project, true);
   renderSnapshot(snapshot);
   renderSessions();
   appShell.classList.remove("sidebar-open");
@@ -618,10 +748,14 @@ async function detectBackend() {
     backendState.available = true;
     backendState.configured = health.configured;
     backendState.health = health;
+    backendState.selectedApprovalMode = ["strict", "balanced", "auto"].includes(health.approval)
+      ? health.approval
+      : "balanced";
+    renderApprovalMode();
     $("#profileStatus").textContent = `${health.approval} · ${health.model}`;
     $(".online-dot").title = health.configured ? "Agent 后端已连接" : "后端已连接，API Key 未配置";
     setComposerEnabled(true, health.configured ? "描述真实编程任务…" : "可以先输入任务；配置 CODEYF_API_KEY 后再运行");
-    await loadWorkspaces();
+    await loadProjects();
     await refreshSessions();
     if (backendState.sessions.length) await loadSession(backendState.sessions[0].session_id);
     else startNewTask(false);
@@ -640,7 +774,10 @@ async function ensureSession() {
   if (backendState.sessionId) return backendState.sessionId;
   const session = await api("/api/sessions", {
     method: "POST",
-    body: JSON.stringify({ workspace: backendState.selectedWorkspace?.path || null })
+    body: JSON.stringify({
+      project_id: backendState.selectedProject?.project_id || null,
+      approval_mode: backendState.selectedApprovalMode || null
+    })
   });
   backendState.sessionId = session.session_id;
   backendState.snapshot = session;
@@ -662,11 +799,41 @@ function connectEventStream() {
     const payload = JSON.parse(event.data);
     backendState.lastSeq = Math.max(backendState.lastSeq, payload.seq || 0);
     handleBackendEvent(payload);
+    scheduleSessionWatch(backendState.sessionId);
   }));
   source.onerror = () => {
     source.close();
-    if (backendState.activeTask) window.setTimeout(connectEventStream, 900);
+    if (backendState.activeTask) recoverActiveSession(backendState.sessionId);
   };
+  scheduleSessionWatch(backendState.sessionId);
+}
+
+function scheduleSessionWatch(sessionId) {
+  window.clearTimeout(backendState.watchdogTimer);
+  if (!sessionId || !backendState.activeTask) return;
+  backendState.watchdogTimer = window.setTimeout(() => recoverActiveSession(sessionId), 1500);
+}
+
+async function recoverActiveSession(sessionId) {
+  if (!sessionId || backendState.sessionId !== sessionId || !backendState.activeTask) return;
+  try {
+    const snapshot = await api("/api/sessions/" + sessionId);
+    if (backendState.sessionId !== sessionId) return;
+    const terminal = ["completed", "failed", "cancelled"].includes(snapshot.status);
+    const missedEvents = (snapshot.next_event_seq || 1) - 1 > backendState.lastSeq;
+    if (terminal || missedEvents) {
+      backendState.source?.close();
+      backendState.activeTask = ["running", "waiting_approval"].includes(snapshot.status);
+      renderSnapshot(snapshot, { preserveScroll: true });
+      if (backendState.activeTask) connectEventStream();
+      return;
+    }
+  } catch {
+    // Keep the current UI and retry; switching sessions is no longer required.
+  }
+  if (backendState.sessionId === sessionId && backendState.activeTask) {
+    scheduleSessionWatch(sessionId);
+  }
 }
 
 function approvalDecisionLabel(decision) {
@@ -732,6 +899,12 @@ function handleBackendEvent(event) {
     setRunState(statusLabel(data.to), data.to === "completed");
   } else if (event.type === "model.responded") {
     if (data.usage) backendState.usage = data.usage;
+    if (data.content) appendAgentText(
+      data.content,
+      "模型返回",
+      "",
+      "model-" + (data.model_call_id || event.seq)
+    );
   } else if (event.type === "tool.requested") {
     ensureToolCard(data.tool_call_id, data.name, data.arguments);
   } else if (event.type === "tool.started") {
@@ -747,7 +920,9 @@ function handleBackendEvent(event) {
   } else if (event.type === "task.completed") {
     backendState.activeTask = false;
     backendState.source?.close();
-    appendAgentText(data.final_text || "任务已完成。", "已完成");
+    if (data.final_text && String(data.final_text).trim() !== backendState.lastAssistantText) {
+      appendAgentText(data.final_text, "已完成", "", "task-final-" + event.seq);
+    }
     setRunState("已完成", true);
     refreshSessions();
     showToast("真实任务已完成");
@@ -800,6 +975,10 @@ function submitPrompt(text) {
     showToast("请先配置有效的 CODEYF_API_KEY 并重启后端");
     return;
   }
+  if (!backendState.selectedProject) {
+    showToast("请先创建或选择项目");
+    return;
+  }
   submitRealPrompt(clean);
 }
 
@@ -811,10 +990,11 @@ function startNewTask(focus = true) {
   backendState.snapshot = null;
   backendState.lastSeq = 0;
   backendState.activeTask = false;
+  window.clearTimeout(backendState.watchdogTimer);
   resetDetails();
   renderEmpty();
   $("#threadTitle").textContent = "新任务";
-  $("#breadcrumbPath").textContent = backendState.selectedWorkspace?.path || "请选择工作区";
+  $("#breadcrumbPath").textContent = backendState.selectedProject?.name || "请选择项目";
   setRunState("空闲", false);
   promptInput.value = "";
   promptInput.placeholder = backendState.configured ? "描述一个新的真实编程任务…" : "请先配置 CODEYF_API_KEY 并重启后端";
@@ -823,7 +1003,8 @@ function startNewTask(focus = true) {
 }
 
 function scrollToBottom() {
-  conversation.scrollTo({ top: conversation.scrollHeight, behavior: "smooth" });
+  if (backendState.restoringSnapshot) return;
+  conversation.scrollTo({ top: conversation.scrollHeight, behavior: "auto" });
 }
 
 function autoResizeInput() {
@@ -908,7 +1089,7 @@ async function reconcileApprovalState(sessionId, approvalId, attempt = 0) {
     if (confirmed || toolProgressed || snapshot.status !== "waiting_approval") {
       backendState.source?.close();
       backendState.activeTask = ["running", "waiting_approval"].includes(snapshot.status);
-      renderSnapshot(snapshot);
+      renderSnapshot(snapshot, { preserveScroll: true });
       if (backendState.activeTask) connectEventStream();
       return;
     }
@@ -949,7 +1130,8 @@ $("#newTaskButton").addEventListener("click", () => startNewTask(true));
 $(".workspace-card").addEventListener("click", openWorkspaceModal);
 $("#workspaceClose").addEventListener("click", closeWorkspaceModal);
 workspaceModal.addEventListener("mousedown", (event) => { if (event.target === workspaceModal) closeWorkspaceModal(); });
-$("#workspaceForm").addEventListener("submit", (event) => { event.preventDefault(); selectWorkspace($("#workspaceInput").value); });
+$("#workspaceForm").addEventListener("submit", (event) => { event.preventDefault(); saveProjectForm(); });
+$("#newProjectButton").addEventListener("click", () => beginEditProject(null));
 paletteInput.addEventListener("input", (event) => filterPalette(event.target.value));
 commandPalette.addEventListener("mousedown", (event) => { if (event.target === commandPalette) closePalette(); });
 $$(".palette-results [data-action]").forEach((button) => button.addEventListener("click", () => {
@@ -959,12 +1141,21 @@ $$(".palette-results [data-action]").forEach((button) => button.addEventListener
   closePalette();
 }));
 
-$("#modeButton").addEventListener("click", () => showToast(`当前审批策略：${backendState.health?.approval || "未连接"}`));
+$("#modeButton").addEventListener("click", (event) => {
+  event.stopPropagation();
+  modeMenu.hidden = !modeMenu.hidden;
+  $("#modeButton").setAttribute("aria-expanded", String(!modeMenu.hidden));
+});
+$$("[data-approval-mode]", modeMenu).forEach((button) => button.addEventListener("click", () => selectApprovalMode(button.dataset.approvalMode)));
+document.addEventListener("click", (event) => { if (!event.target.closest(".mode-control")) closeModeMenu(); });
 $("#refreshPreview").addEventListener("click", () => {
   const selected = $("#changeTree .tree-file.selected")?.dataset.file;
   if (selected) loadFilePreview(selected);
   else showToast("当前会话没有真实文件变更");
 });
+$$("[data-editor-view]", $("#editorViewSwitch")).forEach((button) => button.addEventListener("click", () => {
+  setEditorView(button.dataset.editorView);
+}));
 $("#reloadSession").addEventListener("click", () => backendState.sessionId && loadSession(backendState.sessionId));
 
 document.addEventListener("keydown", (event) => {

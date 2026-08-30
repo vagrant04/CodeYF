@@ -99,20 +99,23 @@
 建议最小 HTTP 接口：
 
 ```text
-GET  /api/workspaces
-POST /api/workspaces/select
+GET  /api/projects
+POST /api/projects
+GET  /api/projects/{project_id}
+POST /api/projects/{project_id}
 POST /api/sessions
 GET  /api/sessions
 GET  /api/sessions/{session_id}
 POST /api/sessions/{session_id}/tasks
 POST /api/sessions/{session_id}/cancel
+POST /api/sessions/{session_id}/settings
 POST /api/sessions/{session_id}/approvals/{approval_id}
 GET  /api/sessions/{session_id}/events?after={seq}
 GET  /api/sessions/{session_id}/changes
 GET  /api/sessions/{session_id}/files/{path}
 ```
 
-工作区采用“每任务绑定”语义：选择目录只影响随后创建的新任务；`POST /api/sessions` 必须携带该目录，后端校验目录存在并把规范绝对路径固化到会话。恢复或切换历史任务时，界面显示该任务自己的工作区；所有文件和命令工具继续受该会话工作区约束。运行中的任务不得切换工作区。
+工作区采用“项目绑定”语义：项目固化本机规范绝对目录与共享顶层记忆，一个项目可包含多个会话。`POST /api/sessions` 携带 `project_id`，后端从项目继承工作区。权限菜单以内联浮层展示严格、平衡、完全访问三种模式；空闲会话可切换，运行中禁止切换。
 
 ## 8. 可访问性与键盘
 
@@ -125,7 +128,7 @@ GET  /api/sessions/{session_id}/files/{path}
 
 ## 9. 原型与正式实现边界
 
-当前实现已接入真实会话、任务级工作区选择、SSE 事件、文件预览和审批流程。后续增强项包括：
+当前实现已接入真实项目、多会话、共享顶层记忆、SSE 事件恢复、文件预览和三种权限模式。后续增强项包括：
 
 - 将 DOM 拼接迁移为组件化渲染并加入运行时 schema 校验；
 - 实现大型任务列表虚拟化和终端流式缓冲；

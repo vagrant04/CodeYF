@@ -32,11 +32,11 @@ codeyf web --workspace .
 
 | 前端状态 | 对应后端事件/接口 |
 |---|---|
-| 会话列表 | `GET /api/sessions` |
-| 最近工作区 | `GET /api/workspaces` |
-| 工作区校验 | `POST /api/workspaces/select` |
+| 项目与共享记忆 | `GET/POST /api/projects`、`POST /api/projects/:id` |
+| 会话列表 | `GET /api/sessions`，按 `project_id` 分组 |
 | 会话详情 | `GET /api/sessions/:id` |
-| 任务创建 | `POST /api/sessions`（携带 `workspace`）后调用 `POST /api/sessions/:id/tasks` |
+| 任务创建 | `POST /api/sessions`（携带 `project_id` 与 `approval_mode`）后调用 `POST /api/sessions/:id/tasks` |
+| 权限模式 | `POST /api/sessions/:id/settings`；仅空闲会话可切换 |
 | 助手文本流 | `model.responded` 或单独的 text delta 事件 |
 | 工具执行卡片 | `tool.requested`、`tool.started`、`tool.finished` |
 | 内联权限卡片 | `approval.requested`，提交 `ApprovalDecision` |
@@ -48,4 +48,4 @@ codeyf web --workspace .
 
 建议使用 WebSocket 或 Server-Sent Events 传递只读事件流，普通 HTTP 提交任务、取消和审批决定。前端不得自行执行文件或命令工具，所有副作用继续由后端安全层处理。
 
-工作区选择只接受本机已存在的目录。选中的路径在创建会话时写入会话快照；之后该任务的文件读取、补丁、文件预览和命令执行都由后端以这个目录构造独立的工具注册表，不能被前端临时改到其他目录。
+项目工作区只接受本机已存在的目录。会话继承项目的规范绝对工作区，文件读取、补丁、预览和命令执行均被限制在该目录。项目共享记忆会注入项目内每次任务的系统上下文。

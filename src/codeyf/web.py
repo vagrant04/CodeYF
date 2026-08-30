@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from .agent import AgentLoop
 from .config import AppConfig
-from .domain import AgentSession, SessionStatus
+from .domain import AgentSession, Project, SessionStatus
 from .model import ModelClient, OpenAICompatibleClient
 from .persistence import SessionStore
 from .security import ApprovalBroker, PathGuard, PathSecurityError
@@ -37,6 +37,25 @@ class AgentService:
         self.sessions: dict[str, AgentSession] = {}
         self.threads: dict[str, threading.Thread] = {}
         self.lock = threading.RLock()
+        self.projects: dict[str, Project] = {
+            project.id: project for project in self.store.list_projects()
+        }
+        default_project = next(
+            (
+                project
+                for project in self.projects.values()
+                if project.workspace == self.default_workspace
+            ),
+            None,
+        )
+        if default_project is None:
+            default_project = Project(
+                name=self.default_workspace.name or "默认项目",
+                workspace=self.default_workspace,
+            )
+            self.projects[default_project.id] = default_project
+            self.store.save_project(default_project)
+        self.default_project_id = default_project.id
 
     def resolve_workspace(self, workspace: str | None = None) -> Path:
         target = Path(workspace).expanduser().resolve(strict=True) if workspace else self.default_workspace
@@ -69,13 +88,94 @@ class AgentService:
             for target in sorted(paths.values(), key=lambda path: (path != self.default_workspace, str(path).casefold()))
         ]
 
-    def create_session(self, workspace: str | None = None) -> AgentSession:
+    def list_projects(self) -> list[dict[str, Any]]:
+        session_counts: dict[str, int] = {}
+        for item in self.list():
+            project_id = item.get("project_id")
+            if project_id:
+                session_counts[project_id] = session_counts.get(project_id, 0) + 1
+        return [
+            {
+                **project.snapshot(),
+                "session_count": session_counts.get(project.id, 0),
+                "is_default": project.id == self.default_project_id,
+            }
+            for project in sorted(
+                self.projects.values(),
+                key=lambda item: (item.id != self.default_project_id, item.name.casefold()),
+            )
+        ]
+
+    def get_project(self, project_id: str) -> Project | None:
+        return self.projects.get(project_id)
+
+    def project_for_workspace(self, workspace: Path) -> Project:
+        existing = next(
+            (project for project in self.projects.values() if project.workspace == workspace),
+            None,
+        )
+        if existing:
+            return existing
+        project = Project(name=workspace.name or "本地项目", workspace=workspace)
+        self.projects[project.id] = project
+        self.store.save_project(project)
+        return project
+
+    def create_project(self, name: str, workspace: str, memory: str = "") -> Project:
+        clean_name = name.strip()
+        if not clean_name or len(clean_name) > 120:
+            raise ValueError("项目名称必须为 1..120 个字符")
+        if len(memory) > 32_000:
+            raise ValueError("项目记忆不能超过 32000 个字符")
         target = self.resolve_workspace(workspace)
-        session = AgentSession(target, self.config.model.name, self.config.security.approval)
+        project = Project(name=clean_name, workspace=target, memory=memory.strip())
+        with self.lock:
+            self.projects[project.id] = project
+        self.store.save_project(project)
+        return project
+
+    def update_project(self, project: Project, name: str | None, memory: str | None) -> Project:
+        if name is not None:
+            clean_name = name.strip()
+            if not clean_name or len(clean_name) > 120:
+                raise ValueError("项目名称必须为 1..120 个字符")
+            project.name = clean_name
+        if memory is not None:
+            if len(memory) > 32_000:
+                raise ValueError("项目记忆不能超过 32000 个字符")
+            project.memory = memory.strip()
+        project.updated_at = time.time()
+        self.store.save_project(project)
+        return project
+
+    def create_session(
+        self,
+        workspace: str | None = None,
+        project_id: str | None = None,
+        approval_mode: str | None = None,
+    ) -> AgentSession:
+        if project_id:
+            project = self.get_project(project_id)
+            if project is None:
+                raise ValueError("项目不存在")
+            target = project.workspace
+        else:
+            target = self.resolve_workspace(workspace)
+            project = self.project_for_workspace(target)
+        mode = approval_mode or self.config.security.approval
+        if mode not in {"strict", "balanced", "auto"}:
+            raise ValueError("approval_mode 必须是 strict、balanced 或 auto")
+        session = AgentSession(
+            target,
+            self.config.model.name,
+            mode,
+            project_id=project.id,
+        )
         session.emit("session.created", {
+            "project_id": project.id,
             "workspace": str(target),
             "model": self.config.model.name,
-            "approval_mode": self.config.security.approval,
+            "approval_mode": mode,
             "configured": bool(self.config.api_key),
         })
         with self.lock:
@@ -92,26 +192,44 @@ class AgentService:
             session = self.store.load(session_id)
         except (OSError, ValueError, json.JSONDecodeError):
             return None
+        if session.project_id is None:
+            session.project_id = self.project_for_workspace(session.workspace).id
+            self.store.save(session)
         with self.lock:
             self.sessions[session_id] = session
         return session
 
+    def update_session_approval(self, session: AgentSession, approval_mode: str) -> AgentSession:
+        if approval_mode not in {"strict", "balanced", "auto"}:
+            raise ValueError("approval_mode 必须是 strict、balanced 或 auto")
+        with session.lock:
+            if session.status in {SessionStatus.RUNNING, SessionStatus.WAITING_APPROVAL}:
+                raise RuntimeError("任务运行期间不能切换权限模式")
+            session.approval_mode = approval_mode
+            session.emit("session.settings_changed", {"approval_mode": approval_mode})
+        self.store.save(session)
+        return session
+
     def list(self) -> list[dict[str, Any]]:
         persisted = {item["session_id"]: item for item in self.store.list()}
+        for item in persisted.values():
+            if not item.get("project_id"):
+                try:
+                    workspace = Path(item["workspace"]).resolve(strict=True)
+                    item["project_id"] = self.project_for_workspace(workspace).id
+                except (OSError, KeyError):
+                    continue
         with self.lock:
             for session in self.sessions.values():
                 snapshot = session.snapshot(include_messages=False)
-                first_user = next(
-                    (item.get("content", "") for item in session.messages if item.get("role") == "user"),
-                    "",
-                )
                 persisted[session.id] = {
                     "session_id": session.id,
+                    "project_id": session.project_id,
                     "workspace": str(session.workspace),
                     "model": session.model,
                     "status": session.status.value,
                     "final_text": session.final_text,
-                    "title": first_user.strip()[:80] or "新任务",
+                    "title": session.title,
                     "tool_call_count": session.tool_call_count,
                     "error": session.error,
                     "updated_at": session.updated_at,
@@ -125,7 +243,16 @@ class AgentService:
                 raise RuntimeError("session is busy")
         registry, _ = build_default_registry(session.workspace, self.config.tools, self.config.security)
         model = self.model_factory() if self.model_factory else OpenAICompatibleClient(self.config.model, self.config.api_key)
-        loop = AgentLoop(self.config, model, registry, self.approvals, self.store)
+        project = self.get_project(session.project_id or "")
+        loop = AgentLoop(
+            self.config,
+            model,
+            registry,
+            self.approvals,
+            self.store,
+            project_memory=project.memory if project else "",
+            approval_mode=session.approval_mode,
+        )
 
         def worker() -> None:
             loop.run(session, message)
@@ -143,6 +270,18 @@ class AgentService:
 
 class CodeYFRequestHandler(BaseHTTPRequestHandler):
     server_version = "CodeYF/0.1"
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Browsers routinely close keep-alive/SSE sockets during navigation,
+            # refresh, and EventSource replacement. This is not a server error.
+            return
+        except OSError as exc:
+            if getattr(exc, "winerror", None) in {10053, 10054}:
+                return
+            raise
 
     @property
     def app(self) -> "CodeYFHTTPServer":
@@ -169,6 +308,12 @@ class CodeYFRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/sessions":
             self._json({"sessions": self.app.service.list()})
             return
+        if path == "/api/projects":
+            self._json({
+                "default_project_id": self.app.service.default_project_id,
+                "projects": self.app.service.list_projects(),
+            })
+            return
         if path == "/api/workspaces":
             self._json({
                 "default": str(self.app.service.default_workspace),
@@ -176,6 +321,13 @@ class CodeYFRequestHandler(BaseHTTPRequestHandler):
             })
             return
         parts = [urllib.parse.unquote(item) for item in path.split("/") if item]
+        if len(parts) == 3 and parts[:2] == ["api", "projects"]:
+            project = self.app.service.get_project(parts[2])
+            if project is None:
+                self._error(HTTPStatus.NOT_FOUND, "PROJECT_NOT_FOUND", "项目不存在")
+                return
+            self._json(project.snapshot())
+            return
         if len(parts) >= 3 and parts[:2] == ["api", "sessions"]:
             session = self.app.service.get(parts[2])
             if not session:
@@ -194,6 +346,10 @@ class CodeYFRequestHandler(BaseHTTPRequestHandler):
             if parts[3:] == ["events", "stream"]:
                 after = int(query.get("after", ["0"])[0])
                 self._event_stream(session, after)
+                return
+            if parts[3:] == ["html-preview"]:
+                requested = query.get("path", [""])[0]
+                self._serve_html_preview(session, requested)
                 return
             if parts[3:] == ["files"]:
                 requested = query.get("path", [""])[0]
@@ -235,11 +391,27 @@ class CodeYFRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/sessions":
             try:
-                session = self.app.service.create_session(body.get("workspace"))
+                session = self.app.service.create_session(
+                    body.get("workspace"),
+                    body.get("project_id"),
+                    body.get("approval_mode"),
+                )
             except (OSError, ValueError) as exc:
                 self._error(HTTPStatus.BAD_REQUEST, "INVALID_WORKSPACE", str(exc))
                 return
             self._json(session.snapshot(include_messages=False), status=HTTPStatus.CREATED)
+            return
+        if path == "/api/projects":
+            try:
+                project = self.app.service.create_project(
+                    str(body.get("name", "")),
+                    str(body.get("workspace", "")),
+                    str(body.get("memory", "")),
+                )
+            except (OSError, ValueError) as exc:
+                self._error(HTTPStatus.BAD_REQUEST, "INVALID_PROJECT", str(exc))
+                return
+            self._json(project.snapshot(), status=HTTPStatus.CREATED)
             return
         if path == "/api/workspaces/select":
             workspace = body.get("path")
@@ -254,6 +426,22 @@ class CodeYFRequestHandler(BaseHTTPRequestHandler):
             self._json(self.app.service.workspace_summary(target, self.app.service.default_workspace))
             return
         parts = [urllib.parse.unquote(item) for item in path.split("/") if item]
+        if len(parts) == 3 and parts[:2] == ["api", "projects"]:
+            project = self.app.service.get_project(parts[2])
+            if project is None:
+                self._error(HTTPStatus.NOT_FOUND, "PROJECT_NOT_FOUND", "项目不存在")
+                return
+            try:
+                updated = self.app.service.update_project(
+                    project,
+                    body.get("name"),
+                    body.get("memory"),
+                )
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, "INVALID_PROJECT", str(exc))
+                return
+            self._json(updated.snapshot())
+            return
         if len(parts) < 4 or parts[:2] != ["api", "sessions"]:
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "接口不存在")
             return
@@ -262,6 +450,21 @@ class CodeYFRequestHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.NOT_FOUND, "SESSION_NOT_FOUND", "会话不存在")
             return
         action = parts[3]
+        if action == "settings":
+            approval_mode = body.get("approval_mode")
+            if not isinstance(approval_mode, str):
+                self._error(HTTPStatus.BAD_REQUEST, "INVALID_ARGUMENT", "approval_mode 必须是字符串")
+                return
+            try:
+                updated = self.app.service.update_session_approval(session, approval_mode)
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, "INVALID_APPROVAL_MODE", str(exc))
+                return
+            except RuntimeError as exc:
+                self._error(HTTPStatus.CONFLICT, "SESSION_BUSY", str(exc))
+                return
+            self._json(updated.snapshot(include_messages=False))
+            return
         if action == "tasks":
             message = body.get("message")
             if not isinstance(message, str) or not message.strip():
@@ -337,8 +540,45 @@ class CodeYFRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b": keepalive\n\n")
                 self.wfile.flush()
                 time.sleep(0.5)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
+
+    def _serve_html_preview(self, session: AgentSession, requested: str) -> None:
+        if not requested:
+            self._error(HTTPStatus.BAD_REQUEST, "INVALID_ARGUMENT", "path 必须是非空字符串")
+            return
+        try:
+            target = PathGuard(session.workspace).resolve(requested, must_exist=True)
+            if target.suffix.casefold() not in {".html", ".htm"}:
+                self._error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "NOT_HTML", "只允许预览 .html 或 .htm 文件")
+                return
+            if not target.is_file():
+                self._error(HTTPStatus.NOT_FOUND, "PATH_NOT_FOUND", "文件不存在")
+                return
+            if target.stat().st_size > 2_000_000:
+                self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "FILE_TOO_LARGE", "HTML 文件超过 2 MB，无法预览")
+                return
+            body = target.read_bytes()
+        except PathSecurityError as exc:
+            self._error(HTTPStatus.FORBIDDEN, "PATH_OUTSIDE_WORKSPACE", str(exc))
+            return
+        except OSError as exc:
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "FILE_READ_ERROR", str(exc))
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+            "img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; "
+            "frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'; sandbox allow-scripts",
+        )
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_static(self, url_path: str) -> None:
         relative = urllib.parse.unquote(url_path).lstrip("/") or "index.html"

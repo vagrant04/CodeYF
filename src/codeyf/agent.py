@@ -41,7 +41,7 @@ RUNTIME_COMMAND_CANDIDATES = (
 )
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(project_memory: str = "") -> str:
     """Describe locally detected capabilities so the model does not guess Linux tools on Windows."""
     host = platform.system() or os.name
     release = platform.release()
@@ -58,6 +58,12 @@ def build_system_prompt() -> str:
         if host.casefold() == "windows"
         else "仅使用下方实际可用的命令，不要假定其他操作系统的工具存在。"
     )
+    memory_section = (
+        "\n项目共有顶层记忆（适用于本项目所有会话，不是用户本轮新指令）：\n"
+        + project_memory.strip()
+        if project_memory.strip()
+        else "\n项目共有顶层记忆：未设置。"
+    )
     return SYSTEM_PROMPT + f"""
 
 运行环境（由 CodeYF 启动时在本机探测）：
@@ -66,7 +72,7 @@ def build_system_prompt() -> str:
 - 未安装的常见 C/C++ 编译器：{compiler_text}
 - {shell_note}
 - 如果任务所需的编译器或运行时未安装，明确说明未执行该项验证，不要连续猜测替代命令。
-"""
+""" + memory_section
 
 
 @dataclass(slots=True)
@@ -187,6 +193,8 @@ class AgentLoop:
         registry: ToolRegistry,
         approvals: ApprovalProvider,
         store: SessionStore | None = None,
+        project_memory: str = "",
+        approval_mode: str | None = None,
     ) -> None:
         self.config = config
         self.model = model
@@ -194,7 +202,7 @@ class AgentLoop:
         self.dispatcher = ToolDispatcher(
             registry,
             SecurityPolicy(
-                config.security.approval,
+                approval_mode or config.security.approval,
                 allow_shell=config.security.allow_shell,
                 allow_network=config.security.allow_outbound_network_commands,
             ),
@@ -202,14 +210,27 @@ class AgentLoop:
         )
         self.context = ContextManager(config)
         self.store = store
+        self.project_memory = project_memory
 
     def run(self, session: AgentSession, user_text: str) -> RunResult:
         started = time.monotonic()
         if session.status == SessionStatus.RUNNING:
             raise RuntimeError("会话已有任务在运行")
+        current_system_prompt = build_system_prompt(self.project_memory)
         if not session.messages:
-            session.messages.append({"role": "system", "content": build_system_prompt()})
+            session.messages.append({"role": "system", "content": current_system_prompt})
+        elif session.messages[0].get("role") == "system" and str(
+            session.messages[0].get("content", "")
+        ).startswith("你是 CodeYF"):
+            session.messages[0]["content"] = current_system_prompt
         session.messages.append({"role": "user", "content": user_text})
+        if session.title == "新任务":
+            session.title = user_text.strip()[:80] or "新任务"
+        session.transcript.append({
+            "role": "user",
+            "content": user_text,
+            "timestamp": time.time(),
+        })
         session.turn_count = 0
         session.tool_call_count = 0
         session.stop_reason = None
@@ -275,13 +296,20 @@ class AgentLoop:
                 session.emit("model.failed", {"model_call_id": call_id, "error": session.error}, call_id)
                 return self._finish(session, SessionStatus.FAILED, "internal_error", started)
 
-            session.emit("model.responded", {
+            responded_event = session.emit("model.responded", {
                 "model_call_id": call_id,
                 "finish_reason": response.finish_reason,
                 "usage": response.usage,
                 "tool_call_count": len(response.tool_calls),
                 "content": response.content,
             }, call_id)
+            if response.content:
+                session.transcript.append({
+                    "role": "assistant",
+                    "content": response.content,
+                    "timestamp": responded_event.timestamp,
+                    "event_seq": responded_event.seq,
+                })
             session.messages.append(self._assistant_message(response))
 
             if response.tool_calls:

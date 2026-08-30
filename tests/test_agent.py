@@ -31,6 +31,9 @@ def test_agent_executes_tool_then_returns_final_text(tmp_path: Path) -> None:
     assert session.messages[-2]["role"] == "tool"
     assert session.messages[-2]["tool_call_id"] == "call_1"
     assert any(event.type == "tool.finished" for event in session.events)
+    assert session.title == "读取 hello.txt"
+    assert [item["role"] for item in session.transcript] == ["user", "assistant"]
+    assert session.transcript[0]["content"] == "读取 hello.txt"
 
 
 def test_agent_apply_patch_changes_the_real_workspace_file(tmp_path: Path) -> None:
@@ -85,6 +88,8 @@ def test_context_compaction_preserves_tool_call_result_pair(tmp_path: Path) -> N
     config.model.context_window_tokens = 2500
     config.model.max_output_tokens = 100
     session = AgentSession(tmp_path, "test-model", "balanced")
+    session.title = "永久标题"
+    session.transcript = [{"role": "user", "content": "必须永久显示的用户提示"}]
     session.messages = [{"role": "system", "content": "system"}]
     for index in range(7):
         session.messages.extend([
@@ -100,6 +105,8 @@ def test_context_compaction_preserves_tool_call_result_pair(tmp_path: Path) -> N
             assert compacted[index - 1].get("role") in {"assistant", "tool"}
             assistant = next(item for item in reversed(compacted[:index]) if item.get("role") == "assistant")
             assert any(call["id"] == message["tool_call_id"] for call in assistant.get("tool_calls", []))
+    assert session.title == "永久标题"
+    assert session.transcript == [{"role": "user", "content": "必须永久显示的用户提示"}]
 
 
 def test_agent_reactively_compacts_once_after_provider_overflow(tmp_path: Path) -> None:
@@ -163,3 +170,33 @@ def test_agent_stops_repeating_same_invalid_patch(tmp_path: Path) -> None:
     assert len(finished) == 3
     assert all(event.data["error_code"] == "PATCH_PARSE_ERROR" for event in finished)
     assert not any(tmp_path.iterdir())
+
+
+def test_project_memory_is_injected_and_refreshed_for_existing_session(tmp_path: Path) -> None:
+    model = ScriptedModelClient([
+        ModelResponse(content="first"),
+        ModelResponse(content="second"),
+    ])
+    config = AppConfig()
+    config.storage.enabled = False
+    registry, _ = build_default_registry(tmp_path, config.tools, config.security)
+    active_session = AgentSession(tmp_path, "test-model", "balanced")
+
+    AgentLoop(
+        config,
+        model,
+        registry,
+        AutoDenyApproval(),
+        project_memory="Use Python 3.12.",
+    ).run(active_session, "first task")
+    AgentLoop(
+        config,
+        model,
+        registry,
+        AutoDenyApproval(),
+        project_memory="Use Python 3.13.",
+    ).run(active_session, "second task")
+
+    assert "Use Python 3.12." in model.requests[0][0][0]["content"]
+    assert "Use Python 3.13." in model.requests[1][0][0]["content"]
+    assert "Use Python 3.12." not in model.requests[1][0][0]["content"]

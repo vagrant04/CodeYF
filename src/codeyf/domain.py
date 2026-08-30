@@ -90,10 +90,34 @@ class Event:
 
 
 @dataclass(slots=True)
+class Project:
+    name: str
+    workspace: Path
+    memory: str = ""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "project_id": self.id,
+            "name": self.name,
+            "workspace": str(self.workspace),
+            "memory": self.memory,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass(slots=True)
 class AgentSession:
     workspace: Path
     model: str
     approval_mode: str
+    project_id: str | None = None
+    title: str = "新任务"
+    transcript: list[dict[str, Any]] = field(default_factory=list)
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     status: SessionStatus = SessionStatus.IDLE
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -127,6 +151,9 @@ class AgentSession:
             return {
                 "schema_version": 1,
                 "session_id": self.id,
+                "project_id": self.project_id,
+                "title": self.title,
+                "transcript": list(self.transcript),
                 "workspace": str(self.workspace),
                 "model": self.model,
                 "approval_mode": self.approval_mode,
@@ -148,4 +175,3 @@ MessageRole = Literal["system", "user", "assistant", "tool"]
 
 def new_tool_call_id() -> str:
     return f"call_{uuid.uuid4().hex[:16]}"
-

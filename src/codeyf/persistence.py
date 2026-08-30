@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .domain import AgentSession, Event, SessionStatus
+from .domain import AgentSession, Event, Project, SessionStatus
 
 
 class SessionStore:
@@ -41,6 +41,40 @@ class SessionStore:
                 handle.flush()
                 os.fsync(handle.fileno())
 
+    def save_project(self, project: Project) -> None:
+        if not self.enabled:
+            return
+        directory = self.root / "projects" / project.id
+        directory.mkdir(parents=True, exist_ok=True)
+        self._atomic_json(directory / "project.json", project.snapshot())
+
+    def load_project(self, project_id: str) -> Project:
+        path = self.root / "projects" / project_id / "project.json"
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if data.get("schema_version") != 1:
+            raise ValueError("不支持的项目 schema_version")
+        return Project(
+            id=data["project_id"],
+            name=data["name"],
+            workspace=Path(data["workspace"]).resolve(strict=True),
+            memory=str(data.get("memory", "")),
+            created_at=float(data.get("created_at", 0)),
+            updated_at=float(data.get("updated_at", 0)),
+        )
+
+    def list_projects(self) -> list[Project]:
+        projects_dir = self.root / "projects"
+        if not projects_dir.exists():
+            return []
+        projects: list[Project] = []
+        for path in projects_dir.glob("*/project.json"):
+            try:
+                projects.append(self.load_project(path.parent.name))
+            except (OSError, KeyError, ValueError, json.JSONDecodeError):
+                continue
+        return sorted(projects, key=lambda item: item.updated_at, reverse=True)
+
     def load(self, session_id: str) -> AgentSession:
         path = self.root / "sessions" / session_id / "snapshot.json"
         with path.open("r", encoding="utf-8") as handle:
@@ -48,10 +82,20 @@ class SessionStore:
         if data.get("schema_version") != 1:
             raise ValueError("不支持的会话 schema_version")
         workspace = Path(data["workspace"]).resolve(strict=True)
+        needs_migration = "title" not in data or not isinstance(data.get("transcript"), list)
+        transcript = data.get("transcript")
+        if not isinstance(transcript, list):
+            transcript = self._recover_transcript(data.get("messages", []))
+        title = str(data.get("title") or "").strip()
+        if not title:
+            title = self._title_from_transcript(transcript)
         session = AgentSession(
             workspace=workspace,
             model=data["model"],
             approval_mode=data["approval_mode"],
+            project_id=data.get("project_id"),
+            title=title,
+            transcript=transcript,
             id=data["session_id"],
             status=SessionStatus(data["status"]),
             messages=data.get("messages", []),
@@ -79,6 +123,8 @@ class SessionStore:
                         correlation_id=item.get("correlation_id"),
                         timestamp=float(item["timestamp"]),
                     ))
+        if needs_migration:
+            self._atomic_json(path, session.snapshot(include_messages=True))
         return session
 
     def list(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -91,17 +137,18 @@ class SessionStore:
                 with path.open("r", encoding="utf-8") as handle:
                     data = json.load(handle)
                 messages = data.get("messages", [])
-                first_user = next(
-                    (item.get("content", "") for item in messages if item.get("role") == "user"),
-                    "",
-                )
+                transcript = data.get("transcript")
+                if not isinstance(transcript, list):
+                    transcript = self._recover_transcript(messages)
+                title = str(data.get("title") or "").strip() or self._title_from_transcript(transcript)
                 result.append({
                     "session_id": data["session_id"],
+                    "project_id": data.get("project_id"),
                     "workspace": data["workspace"],
                     "model": data["model"],
                     "status": data["status"],
                     "final_text": data.get("final_text"),
-                    "title": first_user.strip()[:80] or "新任务",
+                    "title": title,
                     "turn_count": int(data.get("turn_count", 0)),
                     "tool_call_count": int(data.get("tool_call_count", 0)),
                     "error": data.get("error"),
@@ -111,6 +158,37 @@ class SessionStore:
                 continue
         result.sort(key=lambda item: item["updated_at"], reverse=True)
         return result[:limit]
+
+    @staticmethod
+    def _recover_transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        transcript = [
+            {"role": item.get("role"), "content": item.get("content")}
+            for item in messages
+            if item.get("role") in {"user", "assistant"} and item.get("content")
+        ]
+        if any(item.get("role") == "user" for item in transcript):
+            return transcript
+        for item in messages:
+            if item.get("role") != "system":
+                continue
+            for line in str(item.get("content") or "").splitlines():
+                if line.startswith("user: "):
+                    transcript.insert(0, {
+                        "role": "user",
+                        "content": line[6:] + "\n\n（旧版会话只保留了压缩摘要，原始提示词无法完整恢复。）",
+                        "recovered": True,
+                    })
+                    return transcript
+        return transcript
+
+    @staticmethod
+    def _title_from_transcript(transcript: list[dict[str, Any]]) -> str:
+        first_user = next(
+            (str(item.get("content") or "").strip() for item in transcript if item.get("role") == "user"),
+            "",
+        )
+        first_line = first_user.splitlines()[0].strip() if first_user else ""
+        return first_line[:80] or "新任务"
 
     @staticmethod
     def _atomic_json(path: Path, data: dict[str, Any]) -> None:

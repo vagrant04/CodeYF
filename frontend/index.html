@@ -64,9 +64,9 @@
         </nav>
 
         <div class="sidebar-footer">
-          <button class="workspace-card">
+          <button class="workspace-card" aria-label="切换或编辑项目">
             <span class="workspace-icon"><svg><use href="#i-folder" /></svg></span>
-            <span><strong id="workspaceName">CodeYF</strong><small id="workspacePath">正在连接后端…</small></span>
+            <span><strong id="workspaceName">CodeYF</strong><small id="workspacePath">正在读取项目…</small></span>
             <svg class="workspace-more"><use href="#i-more" /></svg>
           </button>
           <button class="profile-card">
@@ -82,7 +82,7 @@
           <div class="topbar-title">
             <button class="icon-button mobile-menu" id="mobileMenu" aria-label="打开任务列表"><svg><use href="#i-panel" /></svg></button>
             <div>
-              <div class="breadcrumb"><span>CodeYF</span><svg><use href="#i-chevron" /></svg><span id="breadcrumbPath">真实工作区</span></div>
+              <div class="breadcrumb"><span>CodeYF</span><svg><use href="#i-chevron" /></svg><span id="breadcrumbPath">本地项目</span></div>
               <h1 id="threadTitle">新任务</h1>
             </div>
           </div>
@@ -113,7 +113,15 @@
             <div class="composer-toolbar">
               <div class="composer-tools">
                 <button type="button" class="icon-button small" data-tooltip="添加上下文"><svg><use href="#i-paperclip" /></svg></button>
-                <button type="button" class="mode-button" id="modeButton"><svg><use href="#i-shield" /></svg><span>Agent · Balanced</span><svg class="mini-chevron"><use href="#i-chevron" /></svg></button>
+                <div class="mode-control">
+                  <button type="button" class="mode-button" id="modeButton" aria-label="切换权限模式" aria-haspopup="menu" aria-expanded="false"><svg><use href="#i-shield" /></svg><span>Agent · 平衡</span><svg class="mini-chevron"><use href="#i-chevron" /></svg></button>
+                  <div class="mode-menu" id="modeMenu" role="menu" hidden>
+                    <button type="button" role="menuitemradio" data-approval-mode="strict"><strong>严格</strong><small>所有命令都需要确认</small></button>
+                    <button type="button" role="menuitemradio" data-approval-mode="balanced"><strong>平衡</strong><small>仅敏感命令需要确认</small></button>
+                    <button type="button" role="menuitemradio" data-approval-mode="auto"><strong>完全访问</strong><small>自动运行命令，不逐条审批</small></button>
+                    <p>始终保留工作区边界与危险命令硬阻止。</p>
+                  </div>
+                </div>
               </div>
               <div class="composer-actions">
                 <span><kbd>Enter</kbd> 发送</span>
@@ -121,7 +129,7 @@
               </div>
             </div>
           </form>
-          <p class="composer-hint">CodeYF 可能出错。应用修改前请检查 diff，重要操作会请求确认。</p>
+          <p class="composer-hint" id="composerHint">CodeYF 可能出错。应用修改前请检查 diff，重要操作会请求确认。</p>
         </section>
       </main>
 
@@ -141,9 +149,13 @@
           <div class="file-tree" id="changeTree"><div class="panel-empty">当前会话尚未修改文件</div></div>
           <div class="editor-head">
             <div><span class="file-badge python" id="editorBadge">FILE</span><strong id="editorFileName">未选择文件</strong></div>
-            <span>磁盘当前内容</span>
+            <div class="editor-view-switch" id="editorViewSwitch" hidden>
+              <button type="button" class="active" data-editor-view="preview">预览</button>
+              <button type="button" data-editor-view="code">代码</button>
+            </div>
           </div>
           <div class="code-editor" id="codeEditor" aria-label="代码预览"><div class="panel-empty">应用补丁后，可在此查看磁盘上的真实文件内容。</div></div>
+          <iframe class="html-preview" id="htmlPreview" title="HTML 页面预览" sandbox="allow-scripts" referrerpolicy="no-referrer" hidden></iframe>
         </section>
 
         <section class="detail-content" data-content="terminal">
@@ -174,20 +186,25 @@
       <div class="workspace-dialog" role="dialog" aria-modal="true" aria-labelledby="workspaceTitle">
         <div class="workspace-dialog-head">
           <div class="workspace-switch-icon"><svg><use href="#i-folder" /></svg></div>
-          <div><span class="eyebrow">本地目录</span><h2 id="workspaceTitle">切换工作区</h2></div>
+          <div><span class="eyebrow">项目与工作区</span><h2 id="workspaceTitle">项目设置</h2></div>
           <button class="icon-button" id="workspaceClose" aria-label="关闭"><svg><use href="#i-x" /></svg></button>
         </div>
-        <p class="workspace-help">新任务的文件读取、修改和命令执行都会限制在所选目录内。历史任务继续使用各自原工作区。</p>
+        <p class="workspace-help">每个项目绑定一个工作区，并拥有供该项目所有会话共享的顶层记忆。</p>
         <div class="workspace-recent">
-          <span class="workspace-label">最近工作区</span>
+          <span class="workspace-label">项目</span>
           <div id="workspaceList"><div class="panel-empty">正在读取…</div></div>
         </div>
         <form id="workspaceForm">
-          <label for="workspaceInput">本机目录绝对路径</label>
+          <div class="project-form-heading"><span class="workspace-label" id="projectFormTitle">编辑当前项目</span><button type="button" class="ghost-button compact" id="newProjectButton">创建新项目</button></div>
+          <label for="projectNameInput">项目名称</label>
+          <input class="project-field" id="projectNameInput" autocomplete="off" maxlength="120" placeholder="例如 CodeYF" />
+          <label for="workspaceInput">项目工作区绝对路径</label>
           <div class="workspace-input-row">
             <input id="workspaceInput" autocomplete="off" spellcheck="false" placeholder="例如 D:\\Projects\\my-app" />
-            <button class="primary-button" type="submit">使用此目录</button>
+            <button class="primary-button" id="projectFormSubmit" type="submit">保存项目</button>
           </div>
+          <label for="projectMemoryInput">项目共有顶层记忆</label>
+          <textarea class="project-field project-memory" id="projectMemoryInput" maxlength="32000" placeholder="例如：使用 Python 3.12；测试命令为 pytest；提交信息使用中文。"></textarea>
           <small id="workspaceError" role="alert"></small>
         </form>
       </div>

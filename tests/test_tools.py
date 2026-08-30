@@ -273,6 +273,22 @@ def test_policy_denies_windows_shell_file_write_bypass() -> None:
     assert powershell_result.rule_ids == ("CMD_FILE_WRITE_BYPASS",)
 
 
+def test_auto_mode_runs_installed_command_without_approval(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    registry.register(RunCommandTool(PathGuard(tmp_path), ToolConfig(), SecurityConfig()))
+    active_session = session(tmp_path)
+    dispatcher = ToolDispatcher(registry, SecurityPolicy("auto"), AutoDenyApproval())
+
+    result = dispatcher.execute(
+        ToolCall("call_auto", "run_command", {"argv": [sys.executable, "-c", "print('auto')"]}),
+        active_session,
+    )
+
+    assert result.ok
+    assert result.data["stdout"].strip() == "auto"
+    assert not any(event.type == "approval.requested" for event in active_session.events)
+
+
 def test_run_command_honors_session_cancellation(tmp_path: Path) -> None:
     active_session = session(tmp_path)
     tool = RunCommandTool(PathGuard(tmp_path), ToolConfig(command_timeout_seconds=10), SecurityConfig())

@@ -6,6 +6,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ import pytest
 from codeyf.config import AppConfig
 from codeyf.domain import ModelResponse, ToolCall
 from codeyf.model import ScriptedModelClient
-from codeyf.web import AgentService, CodeYFHTTPServer
+from codeyf.web import AgentService, CodeYFHTTPServer, CodeYFRequestHandler
 
 
 def request_json(url: str, method: str = "GET", payload: dict | None = None) -> dict:
@@ -21,6 +22,16 @@ def request_json(url: str, method: str = "GET", payload: dict | None = None) -> 
     request = urllib.request.Request(url, data=body, method=method, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=3) as response:
         return json.loads(response.read())
+
+
+def test_request_handler_silences_client_disconnect_before_request_line(monkeypatch) -> None:
+    handler = object.__new__(CodeYFRequestHandler)
+
+    def abort(_handler) -> None:
+        raise ConnectionAbortedError(10053, "client aborted")
+
+    monkeypatch.setattr(BaseHTTPRequestHandler, "handle", abort)
+    handler.handle()
 
 
 def test_web_health_session_and_unconfigured_task_failure(tmp_path: Path, monkeypatch) -> None:
@@ -221,3 +232,70 @@ def test_http_server_rejects_second_instance_on_same_port(tmp_path: Path) -> Non
             )
     finally:
         first.server_close()
+
+
+def test_projects_own_workspaces_memories_and_multiple_sessions(tmp_path: Path) -> None:
+    default_workspace = tmp_path / "default"
+    workspace_a = tmp_path / "project-a"
+    workspace_b = tmp_path / "project-b"
+    frontend = tmp_path / "frontend"
+    for directory in (default_workspace, workspace_a, workspace_b, frontend):
+        directory.mkdir()
+    (frontend / "index.html").write_text("<h1>CodeYF</h1>", encoding="utf-8")
+    config = AppConfig()
+    config.storage.enabled = False
+    service = AgentService(config, default_workspace)
+    server = CodeYFHTTPServer(("127.0.0.1", 0), service, frontend)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        project_a = request_json(base + "/api/projects", "POST", {
+            "name": "Project A",
+            "workspace": str(workspace_a),
+            "memory": "Use pytest.",
+        })
+        project_b = request_json(base + "/api/projects", "POST", {
+            "name": "Project B",
+            "workspace": str(workspace_b),
+            "memory": "Use npm test.",
+        })
+        session_a1 = request_json(base + "/api/sessions", "POST", {
+            "project_id": project_a["project_id"],
+            "approval_mode": "balanced",
+        })
+        session_a2 = request_json(base + "/api/sessions", "POST", {
+            "project_id": project_a["project_id"],
+            "approval_mode": "auto",
+        })
+        session_b = request_json(base + "/api/sessions", "POST", {
+            "project_id": project_b["project_id"],
+        })
+        updated = request_json(
+            base + f"/api/projects/{project_a['project_id']}",
+            "POST",
+            {"name": "Project A+", "memory": "Use Python 3.13."},
+        )
+        projects = request_json(base + "/api/projects")["projects"]
+
+        assert session_a1["project_id"] == project_a["project_id"]
+        assert session_a2["project_id"] == project_a["project_id"]
+        assert session_a1["workspace"] == str(workspace_a)
+        assert session_a2["approval_mode"] == "auto"
+
+        updated_mode = request_json(
+            base + f"/api/sessions/{session_a1['session_id']}/settings",
+            "POST",
+            {"approval_mode": "auto"},
+        )
+        assert updated_mode["approval_mode"] == "auto"
+        assert session_b["project_id"] == project_b["project_id"]
+        assert session_b["workspace"] == str(workspace_b)
+        assert updated["memory"] == "Use Python 3.13."
+        summary_a = next(item for item in projects if item["project_id"] == project_a["project_id"])
+        assert summary_a["name"] == "Project A+"
+        assert summary_a["session_count"] == 2
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

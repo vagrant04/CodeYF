@@ -750,17 +750,20 @@ Web 服务默认仅绑定 `127.0.0.1`，所有响应使用 JSON；任务事件�
 | 方法与路径 | 用途 |
 |---|---|
 | `GET /api/health` | 返回版本、模型名、是否配置密钥、审批模式和上下文窗口 |
-| `GET /api/workspaces` | 返回默认工作区以及从真实会话中发现的最近工作区 |
-| `POST /api/workspaces/select` | 校验本机目录并返回规范路径、显示名与默认标记；不创建任务 |
+| `GET /api/projects` | 返回项目、工作区、共享顶层记忆摘要和会话数 |
+| `POST /api/projects` | 创建项目；请求体包含 `name`、`workspace`、可选 `memory` |
+| `GET /api/projects/{id}` | 返回单个项目 |
+| `POST /api/projects/{id}` | 更新项目名称和共享顶层记忆；工作区保持不可变 |
 | `GET /api/sessions` | 返回真实会话摘要；`title` 来自首条用户消息 |
-| `POST /api/sessions` | 创建会话；请求体可携带 `workspace`，省略时使用启动参数指定的默认工作区 |
+| `POST /api/sessions` | 创建会话；请求体可携带 `project_id` 与 `approval_mode` |
 | `GET /api/sessions/{id}` | 返回会话快照、消息与事件 |
+| `POST /api/sessions/{id}/settings` | 空闲时切换 `strict\|balanced\|auto` 权限模式 |
 | `POST /api/sessions/{id}/tasks` | 提交真实任务 |
 | `GET /api/sessions/{id}/events/stream` | 消费 SSE 事件流 |
 | `GET /api/sessions/{id}/files?path=...` | 预览该会话工作区内磁盘文件的当前 UTF-8 内容 |
 | `POST /api/sessions/{id}/approvals/{approval_id}` | 提交审批决定 |
 
-每个 Web 任务对应一个会话，并在创建时固化一个规范绝对工作区路径。路径必须指向本机已存在的目录。会话创建后不得通过前端切换其工作区；`read_file`、`list_files`、`search_text`、`apply_patch`、`run_command` 与文件预览均使用会话自身的 `workspace`，而不是 Web 进程的当前目录或前端当前选择。
+每个项目固化一个规范绝对工作区路径，并可包含多个会话。会话继承项目工作区和共享顶层记忆；记忆更新在该项目所有会话的下一次任务中生效。运行中的会话禁止切换权限模式。`auto` 会跳过命令逐条审批，但路径沙箱、硬禁止规则、shell 配置和命令存在性预检始终生效。
 
 文件预览接口必须复用 `PathGuard`，拒绝工作区逃逸、非 UTF-8 文件和超过 500 KB 的文件。它只用于展示 `apply_patch` 后磁盘上的真实状态，不执行修改。
 
