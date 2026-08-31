@@ -6,7 +6,7 @@ import codeyf.agent as agent_module
 from codeyf.agent import AgentLoop, ContextManager
 from codeyf.config import AppConfig
 from codeyf.domain import AgentSession, ModelResponse, ToolCall
-from codeyf.model import ModelContextExceeded, ScriptedModelClient
+from codeyf.model import ModelContextExceeded, ModelProtocolError, ScriptedModelClient
 from codeyf.security import AutoDenyApproval
 from codeyf.tools import build_default_registry
 
@@ -128,6 +128,53 @@ def test_agent_reactively_compacts_once_after_provider_overflow(tmp_path: Path) 
     assert result.status == "completed"
     assert result.final_text == "恢复成功"
     assert any(event.type == "context.compacted" and event.data["strategy"] == "reactive_overflow" for event in session.events)
+
+
+def test_agent_retries_once_after_malformed_tool_arguments(tmp_path: Path) -> None:
+    model = ScriptedModelClient([
+        ModelProtocolError("malformed function.arguments"),
+        ModelResponse(content="recovered", finish_reason="stop"),
+    ])
+    config = AppConfig()
+    config.storage.enabled = False
+    registry, _ = build_default_registry(tmp_path, config.tools, config.security)
+    session = AgentSession(tmp_path, "MiniMax-M2.7", "balanced")
+
+    result = AgentLoop(config, model, registry, AutoDenyApproval()).run(session, "continue")
+
+    assert result.status == "completed"
+    assert result.final_text == "recovered"
+    assert len(model.requests) == 2
+    assert any(event.type == "model.failed" and event.data["recovering"] for event in session.events)
+    assert any(event.type == "model.retrying" and event.data["error_code"] == "MODEL_PROTOCOL" for event in session.events)
+    assert any(
+        message.get("role") == "system" and "function.arguments" in message.get("content", "")
+        for message in model.requests[1][0]
+    )
+
+
+def test_agent_fails_after_second_malformed_tool_arguments(tmp_path: Path) -> None:
+    model = ScriptedModelClient([
+        ModelProtocolError("first malformed arguments"),
+        ModelProtocolError("second malformed arguments"),
+    ])
+    config = AppConfig()
+    config.storage.enabled = False
+    registry, _ = build_default_registry(tmp_path, config.tools, config.security)
+
+    result = AgentLoop(config, model, registry, AutoDenyApproval()).run(
+        AgentSession(tmp_path, "MiniMax-M2.7", "balanced"),
+        "continue",
+    )
+
+    assert result.status == "failed"
+    assert result.stop_reason == "model_protocol"
+    assert result.error == {
+        "code": "MODEL_PROTOCOL",
+        "message": "second malformed arguments",
+        "retryable": False,
+    }
+    assert len(model.requests) == 2
 
 
 def test_system_prompt_reports_windows_and_missing_compilers(monkeypatch) -> None:

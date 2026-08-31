@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 import urllib.error
 import urllib.request
@@ -123,14 +124,14 @@ class OpenAICompatibleClient:
         for item in message.get("tool_calls") or []:
             try:
                 function = item["function"]
-                arguments = function.get("arguments", {})
-                if isinstance(arguments, str):
-                    arguments = json.loads(arguments)
-                if not isinstance(arguments, dict):
-                    raise TypeError("arguments must be object")
-                calls.append(ToolCall(item.get("id") or new_tool_call_id(), function["name"], arguments))
-            except (KeyError, TypeError, json.JSONDecodeError) as exc:
-                raise ModelProtocolError("模型返回了格式错误的工具调用") from exc
+                name = function["name"]
+                arguments = self._parse_tool_arguments(function.get("arguments", {}), tool_name=name)
+                calls.append(ToolCall(item.get("id") or new_tool_call_id(), name, arguments))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                tool_name = str((item.get("function") or {}).get("name") or "unknown") if isinstance(item, dict) else "unknown"
+                raise ModelProtocolError(
+                    f"模型返回了格式错误的工具调用（{tool_name}.arguments 不是可恢复的 JSON 对象）"
+                ) from exc
 
         usage = data.get("usage")
         normalized_usage = None
@@ -147,6 +148,130 @@ class OpenAICompatibleClient:
             response_id=data.get("id"),
             usage=normalized_usage,
         )
+
+    @classmethod
+    def _parse_tool_arguments(cls, value: Any, tool_name: str = "") -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str):
+            raise TypeError("arguments must be a JSON object or string")
+        source = value.strip()
+        fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", source, flags=re.I | re.S)
+        if fenced:
+            source = fenced.group(1).strip()
+        if not source:
+            return {}
+        candidates = [source]
+        without_trailing_commas = cls._remove_trailing_commas(source)
+        if without_trailing_commas != source:
+            candidates.append(without_trailing_commas)
+        last_error: Exception | None = None
+        for candidate in candidates:
+            for strict in (True, False):
+                try:
+                    parsed = json.loads(candidate, strict=strict)
+                except (json.JSONDecodeError, TypeError) as exc:
+                    last_error = exc
+                    continue
+                if not isinstance(parsed, dict):
+                    raise TypeError("arguments must decode to an object")
+                return parsed
+        if tool_name == "apply_patch":
+            recovered_patch = cls._recover_complete_patch_argument(source)
+            if recovered_patch is not None:
+                return {"patch": recovered_patch}
+        raise ValueError("arguments are not recoverable JSON") from last_error
+
+    @classmethod
+    def _recover_complete_patch_argument(cls, source: str) -> str | None:
+        """Recover one narrowly defined MiniMax failure without guessing truncated data.
+
+        Large HTML patches occasionally contain literal quotes or invalid JSON escapes in
+        the outer ``{"patch":"..."}`` wrapper. Recovery is safe only when that wrapper has
+        no other fields and the native patch has both explicit boundary markers. The patch
+        tool still performs its normal format, path and atomicity validation afterwards.
+        """
+        prefix = re.match(r'^\s*\{\s*"patch"\s*:\s*"', source, flags=re.S)
+        suffix = re.search(r'"\s*,?\s*\}\s*$', source, flags=re.S)
+        if not prefix or not suffix or suffix.start() < prefix.end():
+            return None
+        body = source[prefix.end():suffix.start()]
+        patch = cls._decode_relaxed_json_string(body)
+        stripped = patch.strip()
+        if not stripped.startswith("*** Begin Patch") or not stripped.endswith("*** End Patch"):
+            return None
+        return patch
+
+    @staticmethod
+    def _decode_relaxed_json_string(value: str) -> str:
+        output: list[str] = []
+        escapes = {
+            '"': '"',
+            "\\": "\\",
+            "/": "/",
+            "b": "\b",
+            "f": "\f",
+            "n": "\n",
+            "r": "\r",
+            "t": "\t",
+        }
+        index = 0
+        while index < len(value):
+            char = value[index]
+            if char != "\\" or index + 1 >= len(value):
+                output.append(char)
+                index += 1
+                continue
+            escaped = value[index + 1]
+            if escaped == "u" and index + 5 < len(value):
+                digits = value[index + 2:index + 6]
+                if re.fullmatch(r"[0-9a-fA-F]{4}", digits):
+                    output.append(chr(int(digits, 16)))
+                    index += 6
+                    continue
+            if escaped in escapes:
+                output.append(escapes[escaped])
+                index += 2
+                continue
+            # Invalid JSON escapes are common in embedded JavaScript regexes. Preserve
+            # them verbatim because removing the slash would silently change the file.
+            output.extend(("\\", escaped))
+            index += 2
+        return "".join(output)
+
+    @staticmethod
+    def _remove_trailing_commas(source: str) -> str:
+        output: list[str] = []
+        in_string = False
+        escaped = False
+        index = 0
+        while index < len(source):
+            char = source[index]
+            if in_string:
+                output.append(char)
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                index += 1
+                continue
+            if char == '"':
+                in_string = True
+                output.append(char)
+                index += 1
+                continue
+            if char == ",":
+                lookahead = index + 1
+                while lookahead < len(source) and source[lookahead].isspace():
+                    lookahead += 1
+                if lookahead < len(source) and source[lookahead] in "}]":
+                    index += 1
+                    continue
+            output.append(char)
+            index += 1
+        return "".join(output)
 
     @staticmethod
     def _safe_http_error(exc: urllib.error.HTTPError) -> str:

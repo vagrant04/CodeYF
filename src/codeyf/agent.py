@@ -12,7 +12,7 @@ from typing import Any
 
 from .config import AppConfig
 from .domain import AgentSession, ModelResponse, SessionStatus, ToolCall
-from .model import ModelClient, ModelContextExceeded, ModelError
+from .model import ModelClient, ModelContextExceeded, ModelError, ModelProtocolError
 from .persistence import SessionStore
 from .security import ApprovalProvider, SecurityPolicy, canonical_call_hash
 from .tools import ToolDispatcher, ToolRegistry
@@ -249,6 +249,7 @@ class AgentLoop:
         last_failed_signature: str | None = None
         repeat_failures = 0
         overflow_recoveries = 0
+        protocol_recoveries = 0
 
         while True:
             stop = self._limit_reason(session, deadline)
@@ -287,6 +288,32 @@ class AgentLoop:
                     continue
                 session.error = {"code": exc.code, "message": str(exc), "retryable": False}
                 return self._finish(session, SessionStatus.FAILED, "context_exhausted", started)
+            except ModelProtocolError as exc:
+                recovering = protocol_recoveries < 1
+                session.emit("model.failed", {
+                    "model_call_id": call_id,
+                    "error": {"code": exc.code, "message": str(exc), "retryable": recovering},
+                    "recovering": recovering,
+                }, call_id)
+                if recovering:
+                    protocol_recoveries += 1
+                    session.messages.append({
+                        "role": "system",
+                        "content": (
+                            "上一条工具调用参数无法解析。请重新输出工具调用；function.arguments 必须是一个完整 JSON 对象，"
+                            "字符串中的换行、引号和反斜杠必须正确转义。不要使用 Markdown 代码围栏，不要截断参数。"
+                        ),
+                    })
+                    session.emit("model.retrying", {
+                        "model_call_id": call_id,
+                        "attempt": protocol_recoveries + 1,
+                        "delay_ms": 0,
+                        "error_code": exc.code,
+                    }, call_id)
+                    self._save(session)
+                    continue
+                session.error = {"code": exc.code, "message": str(exc), "retryable": False}
+                return self._finish(session, SessionStatus.FAILED, "model_protocol", started)
             except ModelError as exc:
                 session.error = {"code": exc.code, "message": str(exc), "retryable": exc.retryable}
                 session.emit("model.failed", {"model_call_id": call_id, "error": session.error}, call_id)

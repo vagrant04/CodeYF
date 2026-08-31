@@ -60,6 +60,104 @@ def test_openai_adapter_rejects_malformed_tool_arguments(monkeypatch) -> None:
         client.complete([{"role": "user", "content": "read"}], [])
 
 
+def test_openai_adapter_recovers_literal_newlines_in_tool_arguments(monkeypatch) -> None:
+    arguments = '{"patch":"*** Begin Patch\n*** Add File: index.html\n+hello\n*** End Patch"}'
+    payload = {
+        "choices": [{
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_patch",
+                    "function": {"name": "apply_patch", "arguments": arguments},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }]
+    }
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: FakeResponse(payload))
+    client = OpenAICompatibleClient(ModelConfig(base_url="http://localhost:9999/v1"), "test-key")
+
+    response = client.complete([{"role": "user", "content": "create"}], [])
+
+    assert response.tool_calls[0].arguments["patch"].startswith("*** Begin Patch\n")
+
+
+def test_openai_adapter_recovers_fenced_json_and_trailing_comma(monkeypatch) -> None:
+    payload = {
+        "choices": [{
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_list",
+                    "function": {
+                        "name": "list_files",
+                        "arguments": '```json\n{"pattern":"**/*",}\n```',
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }]
+    }
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: FakeResponse(payload))
+    client = OpenAICompatibleClient(ModelConfig(base_url="http://localhost:9999/v1"), "test-key")
+
+    response = client.complete([{"role": "user", "content": "list"}], [])
+
+    assert response.tool_calls[0].arguments == {"pattern": "**/*"}
+
+
+def test_openai_adapter_recovers_complete_html_patch_with_unescaped_quotes(monkeypatch) -> None:
+    arguments = (
+        '{"patch":"*** Begin Patch\\n*** Add File: index.html\\n'
+        '+<html lang="zh-CN">\\n+<script>const pattern = /\\d+/;</script>\\n'
+        '*** End Patch"}'
+    )
+    payload = {
+        "choices": [{
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_patch",
+                    "function": {"name": "apply_patch", "arguments": arguments},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }]
+    }
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: FakeResponse(payload))
+    client = OpenAICompatibleClient(ModelConfig(base_url="http://localhost:9999/v1"), "test-key")
+
+    response = client.complete([{"role": "user", "content": "create"}], [])
+
+    patch = response.tool_calls[0].arguments["patch"]
+    assert '<html lang="zh-CN">' in patch
+    assert "const pattern = /\\d+/;" in patch
+    assert patch.endswith("*** End Patch")
+
+
+def test_openai_adapter_does_not_recover_truncated_patch(monkeypatch) -> None:
+    payload = {
+        "choices": [{
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_patch",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": '{"patch":"*** Begin Patch\\n*** Add File: index.html\\n+<html lang="zh-CN">"}',
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }]
+    }
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: FakeResponse(payload))
+    client = OpenAICompatibleClient(ModelConfig(base_url="http://localhost:9999/v1"), "test-key")
+
+    with pytest.raises(ModelProtocolError):
+        client.complete([{"role": "user", "content": "create"}], [])
+
+
 def test_official_openai_uses_max_completion_tokens(monkeypatch) -> None:
     captured: dict = {}
 

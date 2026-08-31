@@ -42,6 +42,10 @@ def test_web_health_session_and_unconfigured_task_failure(tmp_path: Path, monkey
     alternate = tmp_path / "alternate-repo"
     alternate.mkdir()
     (workspace / "hello.py").write_text("print('real file')\n", encoding="utf-8")
+    (workspace / "preview.html").write_text(
+        "<!doctype html><style>body{color:green}</style><h1>Preview</h1><script>document.body.dataset.ready='yes'</script>",
+        encoding="utf-8",
+    )
     frontend.mkdir()
     (frontend / "index.html").write_text("<h1>CodeYF</h1>", encoding="utf-8")
     config = AppConfig()
@@ -67,6 +71,17 @@ def test_web_health_session_and_unconfigured_task_failure(tmp_path: Path, monkey
         assert snapshot["events"][0]["type"] == "session.created"
         preview = request_json(base + f"/api/sessions/{session['session_id']}/files?path=hello.py")
         assert preview == {"path": "hello.py", "content": "print('real file')\n", "line_count": 1}
+        with urllib.request.urlopen(
+            base + f"/api/sessions/{session['session_id']}/html-preview?path=preview.html",
+            timeout=3,
+        ) as response:
+            html = response.read().decode("utf-8")
+            csp = response.headers["Content-Security-Policy"]
+            assert response.headers.get_content_type() == "text/html"
+            assert "<h1>Preview</h1>" in html
+            assert "connect-src 'none'" in csp
+            assert "form-action 'none'" in csp
+            assert "sandbox allow-scripts" in csp
         accepted = request_json(base + f"/api/sessions/{session['session_id']}/tasks", "POST", {"message": "inspect"})
         assert accepted["accepted"] is True
         for _ in range(30):
@@ -83,6 +98,15 @@ def test_web_health_session_and_unconfigured_task_failure(tmp_path: Path, monkey
             assert exc.code == 403
         else:
             raise AssertionError("path traversal should be rejected")
+        try:
+            urllib.request.urlopen(
+                base + f"/api/sessions/{session['session_id']}/html-preview?path=../outside.html",
+                timeout=3,
+            )
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 403
+        else:
+            raise AssertionError("HTML preview path traversal should be rejected")
     finally:
         server.shutdown()
         server.server_close()

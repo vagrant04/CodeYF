@@ -53,3 +53,17 @@ def test_compacted_snapshot_uses_durable_transcript_without_clearing_history() -
     assert 'if (!hasConversation) renderEmpty();' in render
     assert 'if (!(snapshot.messages || []).some((message) => message.role === "user")) renderEmpty();' not in render
     assert "snapshot.title || firstUser" in render
+
+
+def test_html_preview_uses_sandboxed_iframe_and_code_toggle() -> None:
+    root = Path(__file__).parents[1]
+    source = (root / "frontend" / "app.js").read_text(encoding="utf-8")
+    markup = (root / "frontend" / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="htmlPreview"' in markup
+    assert 'sandbox="allow-scripts"' in markup
+    assert "allow-same-origin" not in markup
+    assert 'data-editor-view="preview"' in markup
+    assert 'data-editor-view="code"' in markup
+    assert "/html-preview?path=" in source
+    assert 'setEditorView(html ? "preview" : "code", path)' in source
